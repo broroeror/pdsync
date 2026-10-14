@@ -6,13 +6,20 @@
 //  - Writes atomically: download to a hidden part file, then rename.
 //  - On any failure the event cursor is not advanced, so the next run retries.
 import { once } from 'node:events';
-import { createWriteStream, mkdirSync, statSync } from 'node:fs';
+import { createReadStream, createWriteStream, mkdirSync, statSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { Writable } from 'node:stream';
-import { DriveEventType, NodeType, type NodeEntity, type ProtonDriveClient } from '@protontech/drive-sdk';
+import { Readable, Writable } from 'node:stream';
+import {
+    DriveEventType,
+    NodeType,
+    NodeWithSameNameExistsValidationError,
+    type NodeEntity,
+    type ProtonDriveClient,
+} from '@protontech/drive-sdk';
+import type { Plan, PlanItem } from './plan.ts';
 import { verbose } from './logging.ts';
 import { moveToTrash, trashTarget } from './trash.ts';
 
@@ -153,10 +160,52 @@ function isUnder(rel: string, folderRel: string) {
     return rel === folderRel || rel.startsWith(folderRel + '/');
 }
 
+/** The kinds of change the user can switch on separately. */
+export type UploadKind = 'new' | 'edits' | 'moves' | 'deletes';
+
+export function kindOf(item: PlanItem): UploadKind {
+    return item.action === 'create-folder' || item.action === 'upload'
+        ? 'new'
+        : item.action === 'update'
+          ? 'edits'
+          : item.action === 'move'
+            ? 'moves'
+            : 'deletes';
+}
+
+function friendlyWriteError(error: unknown) {
+    if (error instanceof NodeWithSameNameExistsValidationError) {
+        return new Error('Drive already has an item with this name there (not synced here); rename one of them');
+    }
+    return error;
+}
+
+// Enough for Drive's previews; anything else is uploaded as generic data.
+const MEDIA_TYPES: Record<string, string> = {
+    txt: 'text/plain', md: 'text/markdown', html: 'text/html', htm: 'text/html', css: 'text/css', csv: 'text/csv',
+    json: 'application/json', xml: 'application/xml', js: 'text/javascript', pdf: 'application/pdf',
+    zip: 'application/zip', gz: 'application/gzip', '7z': 'application/x-7z-compressed', tar: 'application/x-tar',
+    png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
+    heic: 'image/heic', bmp: 'image/bmp', tif: 'image/tiff', tiff: 'image/tiff',
+    mp3: 'audio/mpeg', wav: 'audio/wav', flac: 'audio/flac', ogg: 'audio/ogg', m4a: 'audio/mp4', opus: 'audio/opus',
+    mp4: 'video/mp4', mkv: 'video/x-matroska', webm: 'video/webm', mov: 'video/quicktime', avi: 'video/x-msvideo',
+    doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ppt: 'application/vnd.ms-powerpoint', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    odt: 'application/vnd.oasis.opendocument.text', ods: 'application/vnd.oasis.opendocument.spreadsheet',
+    odp: 'application/vnd.oasis.opendocument.presentation',
+};
+
+function mediaTypeOf(rel: string) {
+    const ext = path.extname(rel).slice(1).toLowerCase();
+    return MEDIA_TYPES[ext] ?? 'application/octet-stream';
+}
+
 export class Mirror {
     private rootUid = '';
     private needsRescan = false;
     downloaded = 0;
+    uploaded = 0;
     trashed = 0;
     skipped = 0;
     // Disk identity -> path of everything in the mirror folder, built on first
@@ -477,6 +526,75 @@ export class Mirror {
         const forget = this.db.prepare('DELETE FROM nodes WHERE uid = ?');
         for (const r of descendants) forget.run(r.uid);
         this.needsRescan = true;
+    }
+
+    /**
+     * Carry out the planned changes of the given kinds on Drive. Only kinds the
+     * user switched on are passed in; everything else in the plan is left.
+     * Stage 1: new folders and new files (nothing existing on Drive is touched).
+     */
+    async applyPlan(plan: Plan, kinds: Set<UploadKind>) {
+        if (plan.blocked) return;
+        const rootUid = (await this.client.getMyFilesRootFolder()).uid;
+        const parentUid = (rel: string) => {
+            const parent = path.posix.dirname(rel);
+            if (parent === '.') return rootUid;
+            const row = this.db.prepare("SELECT uid FROM nodes WHERE rel_path = ? AND type = 'folder'").get(parent) as
+                | { uid: string }
+                | undefined;
+            return row?.uid;
+        };
+        for (const item of plan.items) {
+            if (!kinds.has(kindOf(item))) continue;
+            if (item.action === 'create-folder') await this.createFolder(item.rel, parentUid(item.rel));
+            else if (item.action === 'upload') await this.uploadNew(item.rel, parentUid(item.rel));
+        }
+    }
+
+    private async createFolder(rel: string, parent: string | undefined) {
+        if (!parent) return this.fail(rel, 'creating the folder', new Error('its parent folder is not on Drive'));
+        try {
+            const node = await this.client.createFolder(parent, path.posix.basename(rel));
+            const { ino } = await fs.stat(this.abs(rel));
+            this.upsert({ uid: node.uid, type: 'folder', rel_path: rel, revision_uid: null, local_size: null, local_mtime_ms: null, local_ino: ino });
+            this.record('created', rel + '/', 'folder created on Drive');
+        } catch (error) {
+            this.fail(rel + '/', 'creating the folder', friendlyWriteError(error));
+        }
+    }
+
+    private async uploadNew(rel: string, parent: string | undefined) {
+        if (!parent) return this.fail(rel, 'uploading', new Error('its folder is not on Drive'));
+        const target = this.abs(rel);
+        try {
+            const before = await fs.stat(target);
+            const uploader = await this.client.getFileUploader(parent, path.posix.basename(rel), {
+                mediaType: mediaTypeOf(rel),
+                expectedSize: before.size,
+                modificationTime: before.mtime,
+            });
+            const controller = await uploader.uploadFromStream(Readable.toWeb(createReadStream(target)) as ReadableStream, []);
+            const { nodeUid, nodeRevisionUid } = await controller.completion();
+            // Record what was uploaded (the 'before' stat): if the file changed
+            // while uploading, the next run sees it as edited and uploads again.
+            this.upsert({
+                uid: nodeUid,
+                type: 'file',
+                rel_path: rel,
+                revision_uid: nodeRevisionUid,
+                local_size: before.size,
+                local_mtime_ms: Math.trunc(before.mtimeMs),
+                local_ino: before.ino,
+            });
+            const after = await fs.stat(target);
+            if (after.size !== before.size || Math.trunc(after.mtimeMs) !== Math.trunc(before.mtimeMs)) {
+                this.warn(`${rel}: changed while it was uploading; the newer version goes up next time`);
+            }
+            this.uploaded++;
+            this.record('upload', rel);
+        } catch (error) {
+            this.fail(rel, 'uploading', friendlyWriteError(error));
+        }
     }
 
     /**
@@ -813,7 +931,9 @@ export class Mirror {
 
     private record(kind: string, rel: string, detail?: string) {
         addActivity(this.db, kind, rel, detail);
-        const symbol = { download: '↓', move: '→', removed: '✕', skipped: '!', failed: '✗', warning: '!', resolved: '✓' }[kind] ?? '·';
+        const symbol =
+            { download: '↓', upload: '↑', created: '+', move: '→', removed: '✕', skipped: '!', failed: '✗', warning: '!', resolved: '✓' }[kind] ??
+            '·';
         const line = kind === 'move' ? `${symbol} ${detail}  →  ${rel}` : `${symbol} ${rel}${detail ? `: ${detail}` : ''}`;
         (kind === 'failed' ? console.error : kind === 'skipped' || kind === 'warning' ? console.warn : console.log)(line);
     }

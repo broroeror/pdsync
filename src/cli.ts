@@ -6,7 +6,9 @@ import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { ApiError } from './api.ts';
 import { acquireLock, lockHolder } from './lock.ts';
-import { finishRun, getMeta, Mirror, openState, setMeta, startRun, STATE_DIR } from './mirror.ts';
+import { randomUUID } from 'node:crypto';
+import { finishRun, getMeta, kindOf, Mirror, openState, setMeta, startRun, STATE_DIR, type UploadKind } from './mirror.ts';
+import { ask } from './prompt.ts';
 import { planUploads, type Plan } from './plan.ts';
 import { describeTrash, prepareTrashFolder, trashTarget } from './trash.ts';
 import { installService, serviceInfo, serviceStatus, uninstallService } from './service.ts';
@@ -22,6 +24,11 @@ const USAGE = `Usage: npm run pdsync -- <command>
                       first run. Add --full to rescan everything.
   plan                Dry run of uploading: sync with Drive, then list what
                       would change on Drive. Changes nothing on Drive.
+  push <kinds> [--yes]
+                      Upload now, after showing what and asking (kinds: new)
+  config uploads <kinds>|none
+                      Which kinds of local change automatic runs upload
+                      (off until you switch them on)
   status              Login, folder, last run, automatic sync
   activity            Recent downloads, moves, removals and warnings
   review              Files the mirror skipped and why
@@ -51,8 +58,30 @@ function checkFolder(folder: string) {
     }
 }
 
+const UPLOAD_KINDS: UploadKind[] = ['new', 'edits', 'moves', 'deletes'];
+// Built so far; the rest are refused until they exist.
+const AVAILABLE_KINDS = new Set<UploadKind>(['new']);
+
+/** Upload kinds switched on for automatic runs. */
+function enabledKinds(db: DatabaseSync) {
+    return new Set((getMeta(db, 'uploads') ?? '').split(',').filter((k): k is UploadKind => AVAILABLE_KINDS.has(k as UploadKind)));
+}
+
+function parseKinds(words: string[]) {
+    const kinds = new Set<UploadKind>();
+    for (const w of words) {
+        if (w === 'all') AVAILABLE_KINDS.forEach((k) => kinds.add(k));
+        else if (!UPLOAD_KINDS.includes(w as UploadKind)) throw new UserError(`Unknown kind "${w}" (use: ${UPLOAD_KINDS.join(', ')})`);
+        else if (!AVAILABLE_KINDS.has(w as UploadKind)) throw new UserError(`Uploading "${w}" isn't built yet (available: ${[...AVAILABLE_KINDS].join(', ')})`);
+        else kinds.add(w as UploadKind);
+    }
+    return kinds;
+}
+
 async function openMirror(db: DatabaseSync, folder: string) {
-    const { client, username } = await openClient();
+    let clientUid = getMeta(db, 'client_uid');
+    if (!clientUid) setMeta(db, 'client_uid', (clientUid = randomUUID()));
+    const { client, username } = await openClient(clientUid);
     const account = getMeta(db, 'account');
     if (account && account !== username) {
         throw new UserError(`This mirror belongs to ${account}. To mirror ${username}, choose a new folder first (config folder).`);
@@ -61,7 +90,14 @@ async function openMirror(db: DatabaseSync, folder: string) {
     return new Mirror(client, db, folder);
 }
 
-async function runMirror(db: DatabaseSync, given: string | undefined, full: boolean) {
+async function runMirror(
+    db: DatabaseSync,
+    given: string | undefined,
+    full: boolean,
+    // Upload kinds to carry out after catching up; default: those switched on.
+    // `confirm` sees the items first and may cancel.
+    upload: { kinds?: Set<UploadKind>; confirm?: (items: Plan['items']) => Promise<boolean> } = {},
+) {
     const folder = given ? path.resolve(given) : getMeta(db, 'root_dir');
     if (!folder) throw new UserError('First run: say which folder to mirror into, e.g.  npm run pdsync -- mirror ~/DriveMirror');
     checkFolder(folder);
@@ -73,6 +109,15 @@ async function runMirror(db: DatabaseSync, given: string | undefined, full: bool
     try {
         mirror = await openMirror(db, folder);
         await mirror.run({ full });
+        const kinds = upload.kinds ?? enabledKinds(db);
+        if (kinds.size && !mirror.failures) {
+            const plan = await planUploads(db, folder);
+            if (plan.blocked) console.log(plan.blocked);
+            const items = plan.items.filter((i) => kinds.has(kindOf(i)));
+            if (items.length && (!upload.confirm || (await upload.confirm(items)))) {
+                await mirror.applyPlan(plan, kinds);
+            }
+        }
     } catch (error) {
         const auth = error instanceof AuthError || (error instanceof ApiError && error.status === 401);
         finishRun(db, runId, {
@@ -89,6 +134,7 @@ async function runMirror(db: DatabaseSync, given: string | undefined, full: bool
     notifyChanged();
 
     const parts = [`${mirror.downloaded} downloaded`];
+    if (mirror.uploaded) parts.push(`${mirror.uploaded} uploaded`);
     if (mirror.trashed) parts.push(`${mirror.trashed} moved to trash (deleted on Drive)`);
     if (mirror.skipped) parts.push(`${mirror.skipped} skipped (see: review)`);
     if (mirror.failures) parts.push(`${mirror.failures} failed; they will be retried next run`);
@@ -96,16 +142,16 @@ async function runMirror(db: DatabaseSync, given: string | undefined, full: bool
     if (mirror.failures) process.exitCode = 1;
 }
 
-function printPlan(plan: Plan) {
+function printPlan(plan: Plan, verb: 'Would' | 'Will' = 'Would') {
     if (plan.blocked) return console.log(`\n${plan.blocked}`);
     const size = (n: number) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`);
     const groups: [string, string[]][] = [
-        ['Would create on Drive', plan.items.flatMap((i) => (i.action === 'create-folder' ? [`+ ${i.rel}/`] : []))],
-        ['Would rename or move on Drive', plan.items.flatMap((i) => (i.action === 'move' ? [`→ ${i.from}  →  ${i.to}`] : []))],
-        ['Would upload (new)', plan.items.flatMap((i) => (i.action === 'upload' ? [`+ ${i.rel}  (${size(i.size)})`] : []))],
-        ['Would upload a new version (edited here)', plan.items.flatMap((i) => (i.action === 'update' ? [`~ ${i.rel}  (${size(i.size)})`] : []))],
+        [`${verb} create on Drive`, plan.items.flatMap((i) => (i.action === 'create-folder' ? [`+ ${i.rel}/`] : []))],
+        [`${verb} rename or move on Drive`, plan.items.flatMap((i) => (i.action === 'move' ? [`→ ${i.from}  →  ${i.to}`] : []))],
+        [`${verb} upload (new)`, plan.items.flatMap((i) => (i.action === 'upload' ? [`+ ${i.rel}  (${size(i.size)})`] : []))],
+        [`${verb} upload a new version (edited here)`, plan.items.flatMap((i) => (i.action === 'update' ? [`~ ${i.rel}  (${size(i.size)})`] : []))],
         [
-            "Would move to Drive's trash (recoverable)",
+            `${verb} move to Drive's trash (recoverable)`,
             plan.items.flatMap((i) => (i.action === 'trash' ? [`✕ ${i.rel}${i.type === 'folder' ? `/  (${i.files} files)` : ''}`] : [])),
         ],
         ['Held back', plan.held.map((h) => `· ${h.rel ? `${h.rel}: ` : ''}${h.why}`)],
@@ -117,7 +163,7 @@ function printPlan(plan: Plan) {
         console.log(`${title}:`);
         for (const line of lines) console.log(`  ${line}`);
     }
-    console.log('\nThis was a dry run: nothing was changed on Drive.');
+    if (verb === 'Would') console.log('\nThis was a dry run: nothing was changed on Drive.');
 }
 
 async function status(db: DatabaseSync) {
@@ -140,6 +186,7 @@ async function status(db: DatabaseSync) {
             : null,
         reviewCount,
         trash: trashTarget(db),
+        uploads: [...enabledKinds(db)],
         service: serviceInfo(),
     };
 }
@@ -169,6 +216,22 @@ async function main(command: string | undefined, args: string[]) {
         }
         case 'mirror':
             return runMirror(openState(), positional[0], args.includes('--full'));
+        case 'push': {
+            const kinds = parseKinds(positional);
+            if (!kinds.size) throw new UserError('Say what to upload, e.g.  push new');
+            const db = openState();
+            return runMirror(db, undefined, false, {
+                kinds,
+                confirm: async (items) => {
+                    printPlan({ items, held: [] }, 'Will');
+                    if (args.includes('--yes')) return true;
+                    const answer = await ask(`\nUpload ${items.length === 1 ? 'this' : `these ${items.length} items`} to Drive? [y/N] `);
+                    if (/^y(es)?$/i.test(answer)) return true;
+                    console.log('Cancelled; nothing was changed on Drive.');
+                    return false;
+                },
+            });
+        }
         case 'plan': {
             const db = openState();
             // Catch up with Drive first, so conflicts are already in Review.
@@ -191,6 +254,7 @@ async function main(command: string | undefined, args: string[]) {
             }
             if (s.reviewCount) console.log(`To review:   ${s.reviewCount} skipped file(s) (see: review)`);
             console.log(`Drive deletes go to: ${describeTrash(s.trash)}`);
+            console.log(`Uploads:     ${s.uploads.length ? s.uploads.join(', ') : 'off (download only)'}`);
             console.log(`Automatic:   ${s.service.enabled ? (s.service.intervalMinutes ? `every ${s.service.intervalMinutes} min` : 'on') : 'off'}`);
             return;
         }
@@ -260,6 +324,12 @@ async function main(command: string | undefined, args: string[]) {
         case 'config': {
             const [key, value] = positional;
             const db = openState();
+            if (key === 'uploads' && value) {
+                const kinds = value === 'none' ? new Set<UploadKind>() : parseKinds(positional.slice(1));
+                setMeta(db, 'uploads', [...kinds].join(','));
+                notifyChanged();
+                return console.log(kinds.size ? `Automatic runs now upload: ${[...kinds].join(', ')}.` : 'Automatic runs upload nothing (download only).');
+            }
             if (key === 'trash' && value) {
                 if (value === 'desktop') {
                     db.prepare("DELETE FROM meta WHERE key = 'trash'").run();

@@ -90,7 +90,8 @@ export async function interactiveLogin() {
     console.log(`Logged in as ${username}. The login is saved in your desktop keyring.`);
 }
 
-export async function openClient() {
+/** `clientUid` identifies this installation, so the SDK can clean up its own interrupted uploads. */
+export async function openClient(clientUid?: string) {
     initCrypto();
     const raw = await loadSecret();
     if (!raw) throw new AuthError('Not logged in.');
@@ -118,6 +119,7 @@ export async function openClient() {
         openPGPCryptoModule: openPGPModule(),
         srpModule: srpModule(api),
         telemetry,
+        config: { clientUid },
     });
     return { api, client, username: stored.username };
 }

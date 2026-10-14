@@ -7,6 +7,7 @@ import path from 'node:path';
 const scratch = await fs.mkdtemp(path.join(process.env.PDSYNC_TEST_TMP || os.tmpdir(), 'pdsync-test-'));
 process.env.XDG_STATE_HOME = path.join(scratch, 'state');
 const { Mirror, openState } = await import('../src/mirror.ts');
+const { NodeWithSameNameExistsValidationError } = await import('@protontech/drive-sdk');
 
 type FakeNode = { uid: string; parentUid?: string; name: string; type: 'file' | 'folder'; rev?: string; content?: string; trashed?: boolean; mediaType?: string };
 
@@ -14,7 +15,7 @@ class FakeDrive {
     nodes = new Map<string, FakeNode>();
     events: any[] = [];
     failDownloads = false;
-    private seq = 0;
+    seq = 0;
 
     constructor() {
         this.nodes.set('root', { uid: 'root', name: 'root', type: 'folder' });
@@ -44,6 +45,16 @@ class FakeDrive {
             activeRevision: n.type === 'file' ? { uid: n.rev, claimedModificationTime: new Date('2025-01-02T03:04:05Z') } : undefined,
         };
     }
+    assertFreeName(parentUid: string, name: string) {
+        for (const n of this.nodes.values()) {
+            if (n.parentUid === parentUid && n.name === name && !n.trashed) {
+                throw new NodeWithSameNameExistsValidationError('exists', 2500, n.uid);
+            }
+        }
+    }
+    childNamed(parentUid: string, name: string) {
+        return [...this.nodes.values()].find((n) => n.parentUid === parentUid && n.name === name && !n.trashed);
+    }
     client(): any {
         return {
             experimental: { getNodeUrl: async (uid: string) => `https://docs.example/open/${uid}` },
@@ -60,6 +71,23 @@ class FakeDrive {
                 const from = Number(last.slice(1));
                 for (const e of this.events) if (Number(e.eventId.slice(1)) > from) yield e;
             }.bind(this),
+            createFolder: async (parentUid: string, name: string) => {
+                this.assertFreeName(parentUid, name);
+                const uid = `new${++this.seq}`;
+                this.add({ uid, parentUid, name, type: 'folder' });
+                return this.entity(this.nodes.get(uid)!);
+            },
+            getFileUploader: async (parentUid: string, name: string) => ({
+                uploadFromStream: async (stream: ReadableStream<Uint8Array>) => ({
+                    completion: async () => {
+                        this.assertFreeName(parentUid, name);
+                        const content = await new Response(stream).text();
+                        const uid = `new${++this.seq}`;
+                        this.add({ uid, parentUid, name, type: 'file', rev: `${uid}-r1`, content });
+                        return { nodeUid: uid, nodeRevisionUid: `${uid}-r1` };
+                    },
+                }),
+            }),
             getFileRevisionDownloader: async (revUid: string) => {
                 const node = [...this.nodes.values()].find((n) => n.rev === revUid)!;
                 const fail = this.failDownloads;
@@ -372,6 +400,53 @@ await run();
 assert.equal(await exists('Old Doc'), false);
 assert.match(await read('Old Doc.desktop'), /^Name=Old Doc$/m);
 console.log('✓ old empty placeholders are upgraded to shortcuts');
+
+// 17. Uploading new files and folders (stage 1).
+const NEW = new Set(['new'] as const);
+await fs.mkdir(path.join(root, 'Uploads/Sub'), { recursive: true });
+await fs.writeFile(path.join(root, 'Uploads/Sub/deep.txt'), 'deep content');
+await fs.writeFile(path.join(root, 'top-new.txt'), 'top content');
+m = new Mirror(drive.client(), db, root);
+await m.run();
+await m.applyPlan(await planUploads(db, root), NEW);
+const uploadsFolder = drive.childNamed('root', 'Uploads')!;
+const sub = drive.childNamed(uploadsFolder.uid, 'Sub')!;
+assert.equal(drive.childNamed(sub.uid, 'deep.txt')?.content, 'deep content');
+assert.equal(drive.childNamed('root', 'top-new.txt')?.content, 'top content');
+assert.ok(m.uploaded >= 2, 'also uploads local-only files left by earlier tests');
+m = await run();
+assert.equal(m.downloaded, 0, 'own uploads are not downloaded back');
+plan = await planUploads(db, root);
+assert.ok(!plan.items.some((i) => 'rel' in i && (i.rel.startsWith('Uploads') || i.rel === 'top-new.txt')), 'nothing left to upload');
+console.log('✓ new folders and files upload into the right place, once');
+
+// Only the kinds switched on are carried out.
+await fs.appendFile(path.join(root, 'top-new.txt'), ' edited');
+await fs.writeFile(path.join(root, 'another-new.txt'), 'A');
+const before = drive.childNamed('root', 'top-new.txt')!.rev;
+m = new Mirror(drive.client(), db, root);
+await m.applyPlan(await planUploads(db, root), NEW);
+assert.equal(drive.childNamed('root', 'top-new.txt')!.rev, before, 'edits stay off');
+assert.ok(drive.childNamed('root', 'another-new.txt'));
+console.log('✓ only switched-on kinds are uploaded (edits untouched)');
+
+// A name already taken on Drive fails politely; the other uploads go ahead.
+drive.nodes.set('ghost', { uid: 'ghost', parentUid: 'root', name: 'taken.txt', type: 'file', rev: 'g1', content: 'on Drive' });
+await fs.writeFile(path.join(root, 'taken.txt'), 'mine');
+await fs.writeFile(path.join(root, 'fine.txt'), 'fine');
+m = new Mirror(drive.client(), db, root);
+await m.applyPlan(await planUploads(db, root), NEW);
+assert.equal(m.failures, 1);
+assert.match((db.prepare("SELECT detail FROM activity WHERE kind = 'failed' ORDER BY id DESC").get() as any).detail, /already has an item with this name/);
+assert.equal(drive.childNamed('root', 'taken.txt')!.content, 'on Drive', 'never overwritten');
+assert.ok(drive.childNamed('root', 'fine.txt'));
+console.log('✓ a name clash on Drive fails politely, others still upload');
+
+// A blocked plan (folder missing / empty) uploads nothing.
+const countBefore = drive.nodes.size;
+await new Mirror(drive.client(), db, root).applyPlan({ items: [{ action: 'upload', rel: 'fine.txt', size: 4 }], held: [], blocked: 'unmounted' }, NEW);
+assert.equal(drive.nodes.size, countBefore);
+console.log('✓ a blocked plan uploads nothing');
 
 await fs.rm(scratch, { recursive: true, force: true });
 console.log('\nall mirror checks passed');
