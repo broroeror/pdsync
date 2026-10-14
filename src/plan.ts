@@ -64,7 +64,11 @@ const isUnder = (rel: string, folder: string) => rel === folder || rel.startsWit
 const depth = (rel: string) => rel.split('/').length;
 
 export async function planUploads(db: DatabaseSync, root: string): Promise<Plan> {
-    const rows = db.prepare('SELECT * FROM nodes').all() as NodeRow[];
+    const allRows = db.prepare('SELECT * FROM nodes').all() as NodeRow[];
+    // Shortcuts to online documents are sync's own: never uploaded, and
+    // deleting one never touches the document on Drive.
+    const links = allRows.filter((r) => r.type === 'link');
+    const rows = allRows.filter((r) => r.type !== 'link') as (NodeRow & { type: 'file' | 'folder' })[];
     const plan: Plan = { items: [], held: [] };
 
     const rootStat = await fs.stat(root).catch(() => null);
@@ -83,10 +87,10 @@ export async function planUploads(db: DatabaseSync, root: string): Promise<Plan>
 
     const matches = (row: NodeRow, e: LocalEntry) => e.size === row.local_size && e.mtimeMs === row.local_mtime_ms;
     const done = new Set<string>(); // row uids accounted for
-    const claimed = new Set<string>(); // local paths accounted for
+    const claimed = new Set<string>(links.map((l) => l.rel_path)); // local paths accounted for
 
     /** A row whose local entry is at `rel`: unchanged, edited, or held. */
-    const settle = (row: NodeRow, rel: string, e: LocalEntry) => {
+    const settle = (row: NodeRow & { type: 'file' | 'folder' }, rel: string, e: LocalEntry) => {
         done.add(row.uid);
         claimed.add(rel);
         if (row.local_ino == null && (row.type === 'folder' || matches(row, e))) backfillIno.run(e.ino, row.uid);
@@ -121,7 +125,7 @@ export async function planUploads(db: DatabaseSync, root: string): Promise<Plan>
     const byIno = new Map<number, LocalEntry>();
     for (const e of local.values()) if (!claimed.has(e.rel)) byIno.set(e.ino, e);
     const missing = rows.filter((r) => !done.has(r.uid)).sort((a, b) => depth(a.rel_path) - depth(b.rel_path));
-    const trashed: NodeRow[] = [];
+    const trashed: typeof rows = [];
 
     for (const row of missing) {
         if (done.has(row.uid)) continue; // carried along with a moved folder

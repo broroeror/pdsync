@@ -17,12 +17,23 @@ import { verbose } from './logging.ts';
 
 export const STATE_DIR = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local/state'), 'pdsync');
 const PART_SUFFIX = '.pdsync-part';
+// Online documents have no file content: they become shortcuts that open them
+// in the browser. [what to call it, icon name]
+const ONLINE_DOCS: Record<string, [string, string]> = {
+    'application/vnd.proton.doc': ['online document', 'x-office-document'],
+    'application/vnd.proton.sheet': ['online spreadsheet', 'x-office-spreadsheet'],
+};
+// Bumped when the local layout changes, to trigger one full rescan.
+// 2: online documents become .desktop shortcuts.
+const LAYOUT_VERSION = '2';
 // Guards against a broken parent chain looping forever.
 const MAX_PARENT_DEPTH = 64;
 
 type Row = {
     uid: string;
-    type: 'file' | 'folder';
+    // 'link' = a shortcut sync writes for an online document (Proton Docs and
+    // Sheets have no file content); the planner never uploads or deletes these.
+    type: 'file' | 'folder' | 'link';
     rel_path: string;
     // Files only: the revision we last wrote, and the size/mtime it had on disk
     // right after, so a later mismatch means it was edited locally.
@@ -167,6 +178,7 @@ export class Mirror {
         const scope = rootNode.treeEventScopeId;
         const cursor = getMeta(this.db, 'event_id');
 
+        if (getMeta(this.db, 'layout') !== LAYOUT_VERSION) full = true;
         if (!cursor || full || getMeta(this.db, 'scope') !== scope) {
             // Take the cursor *before* walking, so changes made during the walk
             // are replayed next run rather than missed.
@@ -175,6 +187,7 @@ export class Mirror {
             if (this.failures === 0) {
                 setMeta(this.db, 'scope', scope);
                 setMeta(this.db, 'event_id', latest);
+                setMeta(this.db, 'layout', LAYOUT_VERSION);
             }
             await this.recheckReview();
             return;
@@ -287,6 +300,7 @@ export class Mirror {
             return;
         }
         if (node.type !== NodeType.File) return;
+        if (node.mediaType && ONLINE_DOCS[node.mediaType]) return this.syncOnlineDoc(node, rel, row);
 
         const revision = node.activeRevision;
         if (!revision) return this.warn(`${rel}: no finished revision on Drive yet, skipped`);
@@ -305,6 +319,61 @@ export class Mirror {
             });
         }
         await this.download(node, rel, revision.uid, revision.claimedModificationTime ?? node.modificationTime);
+    }
+
+    /** An online document becomes "<name>.desktop", a shortcut that opens it in the browser. */
+    private async syncOnlineDoc(node: NodeEntity, rel: string, row: Row | undefined) {
+        const linkRel = `${rel}.desktop`;
+        if (row && row.type === 'file') {
+            // Older versions wrote an empty placeholder: remove it only if it is
+            // still exactly the empty file sync made (nothing to lose).
+            const old = await statOrNull(this.abs(row.rel_path));
+            if (old && old.size === 0 && this.matches(row, old)) await fs.rm(this.abs(row.rel_path));
+            this.db.prepare('DELETE FROM nodes WHERE uid = ?').run(row.uid);
+            row = undefined;
+        }
+        if (row && row.rel_path !== linkRel) {
+            // Renamed on Drive: move our shortcut along (it is rewritten below).
+            const old = await statOrNull(this.abs(row.rel_path));
+            if (old && !(await statOrNull(this.abs(linkRel)))) {
+                await fs.mkdir(path.dirname(this.abs(linkRel)), { recursive: true });
+                await fs.rename(this.abs(row.rel_path), this.abs(linkRel));
+                this.record('move', linkRel, row.rel_path);
+                row = { ...row, rel_path: linkRel };
+            }
+        }
+
+        const [kind, icon] = ONLINE_DOCS[node.mediaType!];
+        const name = path.basename(rel);
+        const content =
+            `[Desktop Entry]\nType=Link\nName=${name}\nComment=${kind[0].toUpperCase() + kind.slice(1)}: opens in your browser\n` +
+            `Icon=${icon}\nURL=${await this.client.experimental.getNodeUrl(node.uid)}\n`;
+        const target = this.abs(linkRel);
+        const existing = await fs.readFile(target, 'utf8').catch(() => null);
+        if (existing === content) {
+            if (!row || row.rel_path !== linkRel) await this.recordLink(node.uid, linkRel);
+            return;
+        }
+        if (existing !== null && !(row && row.rel_path === linkRel)) {
+            return this.warn(`${linkRel}: a file with this name already exists; shortcut to the ${kind} not created`);
+        }
+        await fs.mkdir(path.dirname(target), { recursive: true });
+        await fs.writeFile(target, content);
+        await this.recordLink(node.uid, linkRel);
+        if (existing === null) this.record('download', linkRel, `shortcut to an ${kind}`);
+    }
+
+    private async recordLink(uid: string, linkRel: string) {
+        const stat = await fs.stat(this.abs(linkRel));
+        this.upsert({
+            uid,
+            type: 'link',
+            rel_path: linkRel,
+            revision_uid: null,
+            local_size: stat.size,
+            local_mtime_ms: Math.trunc(stat.mtimeMs),
+            local_ino: stat.ino,
+        });
     }
 
     private async download(node: NodeEntity, rel: string, revisionUid: string, mtime: Date) {
@@ -546,8 +615,10 @@ export class Mirror {
                 continue; // Already gone locally.
             }
             // An edited file is the user's own work, not a leftover.
-            if (r.type === 'file' && !this.matches(r, stat)) continue;
-            insert.run(r.rel_path, r.type, r.type === 'file' ? stat.size : null, r.type === 'file' ? Math.trunc(stat.mtimeMs) : null, reason, Date.now());
+            if (r.type !== 'folder' && !this.matches(r, stat)) continue;
+            // A shortcut left behind is a plain file to the planner.
+            const isFolder = r.type === 'folder';
+            insert.run(r.rel_path, isFolder ? 'folder' : 'file', isFolder ? null : stat.size, isFolder ? null : Math.trunc(stat.mtimeMs), reason, Date.now());
         }
     }
 

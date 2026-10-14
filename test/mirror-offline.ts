@@ -8,7 +8,7 @@ const scratch = await fs.mkdtemp(path.join(process.env.PDSYNC_TEST_TMP || os.tmp
 process.env.XDG_STATE_HOME = path.join(scratch, 'state');
 const { Mirror, openState } = await import('../src/mirror.ts');
 
-type FakeNode = { uid: string; parentUid?: string; name: string; type: 'file' | 'folder'; rev?: string; content?: string; trashed?: boolean };
+type FakeNode = { uid: string; parentUid?: string; name: string; type: 'file' | 'folder'; rev?: string; content?: string; trashed?: boolean; mediaType?: string };
 
 class FakeDrive {
     nodes = new Map<string, FakeNode>();
@@ -37,6 +37,7 @@ class FakeDrive {
             parentUid: n.parentUid,
             name: { ok: true, value: n.name },
             type: n.type,
+            mediaType: n.mediaType,
             trashTime: n.trashed ? new Date() : undefined,
             modificationTime: new Date('2025-01-02T03:04:05Z'),
             treeEventScopeId: 'vol',
@@ -45,6 +46,7 @@ class FakeDrive {
     }
     client(): any {
         return {
+            experimental: { getNodeUrl: async (uid: string) => `https://docs.example/open/${uid}` },
             getMyFilesRootFolder: async () => this.entity(this.nodes.get('root')!),
             getNode: async (uid: string) => this.entity(this.nodes.get(uid)!),
             iterateFolderChildren: async function* (this: FakeDrive, uid: string) {
@@ -264,6 +266,42 @@ assert.equal(await read('spot.txt'), 'Drive spot');
 assert.equal(await read('Elsewhere/spot.txt'), 'my own file');
 assert.ok(!reviewRows().some((r) => r.uid === 'm'));
 console.log('✓ moving the local file away ends the clash and fetches the Drive file');
+
+// 16. Online documents (Proton Docs/Sheets) become shortcuts, never files.
+const DOC = 'application/vnd.proton.doc';
+drive.add({ uid: 'doc1', parentUid: 'root', name: 'Sample File', type: 'file', rev: 'd1', content: '', mediaType: DOC });
+await run();
+assert.equal(await exists('Sample File'), false, 'no empty placeholder');
+const shortcut = await read('Sample File.desktop');
+assert.match(shortcut, /^Type=Link$/m);
+assert.match(shortcut, /^Name=Sample File$/m);
+assert.match(shortcut, /^URL=https:\/\/docs\.example\/open\/doc1$/m);
+console.log('✓ an online document becomes a shortcut that opens it');
+
+drive.update('doc1', { name: 'Renamed Doc' });
+await run();
+assert.equal(await exists('Sample File.desktop'), false);
+assert.match(await read('Renamed Doc.desktop'), /^Name=Renamed Doc$/m);
+console.log('✓ renaming the document on Drive moves its shortcut');
+
+// Shortcuts are never uploaded, and deleting one never trashes the document.
+plan = await planUploads(db, root);
+assert.ok(!plan.items.some((i) => 'rel' in i && i.rel.endsWith('.desktop')));
+await fs.rm(path.join(root, 'Renamed Doc.desktop'));
+plan = await planUploads(db, root);
+assert.ok(!plan.items.some((i) => i.action === 'trash' && i.uid === 'doc1'));
+console.log('✓ the planner never uploads or trashes a shortcut');
+
+// Upgrade: an empty placeholder written by an older version becomes a shortcut.
+await fs.writeFile(path.join(root, 'Old Doc'), '');
+const st = await fs.stat(path.join(root, 'Old Doc'));
+drive.nodes.set('doc2', { uid: 'doc2', parentUid: 'root', name: 'Old Doc', type: 'file', rev: 'o1', content: '', mediaType: DOC });
+db.prepare("INSERT INTO nodes (uid, type, rel_path, revision_uid, local_size, local_mtime_ms) VALUES ('doc2', 'file', 'Old Doc', 'o1', 0, ?)").run(Math.trunc(st.mtimeMs));
+db.prepare("UPDATE meta SET value = '1' WHERE key = 'layout'").run();
+await run();
+assert.equal(await exists('Old Doc'), false);
+assert.match(await read('Old Doc.desktop'), /^Name=Old Doc$/m);
+console.log('✓ old empty placeholders are upgraded to shortcuts');
 
 await fs.rm(scratch, { recursive: true, force: true });
 console.log('\nall mirror checks passed');
