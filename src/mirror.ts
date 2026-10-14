@@ -66,7 +66,7 @@ const ONLINE_DOCS: Record<string, [string, string]> = {
 };
 // Bumped when the local layout changes, to trigger one full rescan.
 // 2: online documents become .desktop shortcuts.
-const LAYOUT_VERSION = '2';
+export const LAYOUT_VERSION = '2';
 // Guards against a broken parent chain looping forever.
 const MAX_PARENT_DEPTH = 64;
 
@@ -95,7 +95,10 @@ export type { Row as NodeRow };
  */
 export function openState(file = path.join(STATE_DIR, 'mirror.db')) {
     mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    const db = new DatabaseSync(file);
+    // A sync run and the app read/write the same files: wait for a lock instead
+    // of failing at once, and use WAL so reading never blocks writing.
+    const db = new DatabaseSync(file, { timeout: 30_000 });
+    db.exec('PRAGMA journal_mode = WAL');
     db.exec(`
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS nodes (
@@ -251,6 +254,8 @@ export class Mirror {
             trash?: TrashTarget;
             /** Called after each recorded action (for live progress). */
             onActivity?: (kind: string, rel: string) => void;
+            /** Called while scanning Drive, with the number of folders checked so far. */
+            onScan?: (foldersChecked: number) => void;
         } = {},
     ) {}
 
@@ -338,8 +343,10 @@ export class Mirror {
     private async fullWalk(rootNode: NodeEntity) {
         const seen = new Set([rootNode.uid]);
         const queue: [string, string][] = [[rootNode.uid, '']];
+        let checked = 0;
         while (queue.length) {
             const [folderUid, folderRel] = queue.shift()!;
+            this.options.onScan?.(checked++);
             try {
                 for await (const child of this.client.iterateFolderChildren(folderUid)) {
                     checkStop();

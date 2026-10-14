@@ -314,6 +314,9 @@ class Backend(QObject):
             if p.get(key):
                 parts.append(f"{locale.toString(p[key])} {label}")
         text = f"Since {clock_time(p.get('startedMs'))}: " + (", ".join(parts) if parts else "checking for changes")
+        if p.get("scanning"):
+            text += f"\nChecking {p['scanning']} on Drive… {locale.toString(p.get('scanned', 0))} folders so far"
+            return text
         if p.get("lastMs"):
             item = p.get("lastItem", "")
             folder = f"{p['folder']} › " if p.get("folder") and len(self._status.get("folders") or []) > 1 else ""

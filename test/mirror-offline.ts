@@ -663,6 +663,8 @@ assert.match(checkNewLocal(db, root) ?? '', /overlaps/);
 assert.match(checkNewLocal(db, os2.homedir()) ?? '', /Refusing/);
 const pairs = listPairs(db);
 assert.deepEqual(pairs.map((p) => p.label), ['My Files', 'Documents', 'Documents (2)']);
+const { getMeta } = await import('../src/mirror.ts');
+assert.ok(getMeta(listPairs(db)[1].db, 'event_id'), 'a new folder starts from Drive\'s current state: no initial scan');
 console.log('✓ adding folders: one device, unique names on Drive, overlaps refused');
 
 const docsPair = pairs[1];
@@ -732,6 +734,12 @@ resetStop();
 m = await run();
 assert.equal((await fs.readdir(root)).filter((f) => f.startsWith('stop-test-')).length, 5, 'the next run carries on');
 console.log('✓ a safe stop leaves no half-written files and the next run finishes the job');
+
+// Scanning Drive reports progress (folders checked so far).
+const scans: number[] = [];
+await new Mirror(drive.client(), db, root, { onScan: (n) => scans.push(n) }).run({ full: true });
+assert.ok(scans.length > 3 && scans.at(-1)! > scans[0], 'scan progress reported as it goes');
+console.log('✓ scanning Drive reports progress as it goes');
 
 // 24. A folder that already exists on Drive (e.g. after an interrupted run) is adopted.
 drive.add({ uid: 'PRE', parentUid: 'root', name: 'Made Before Crash', type: 'folder' });

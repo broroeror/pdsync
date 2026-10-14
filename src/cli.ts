@@ -115,8 +115,13 @@ async function openSession(main: DatabaseSync) {
     return client;
 }
 
-function mirrorFor(client: ProtonDriveClient, main: DatabaseSync, pair: Pair, onActivity?: (kind: string, rel: string) => void) {
-    return new Mirror(client, pair.db, pair.local, { remoteRootUid: pair.remoteUid, trash: trashTarget(main), onActivity });
+function mirrorFor(
+    client: ProtonDriveClient,
+    main: DatabaseSync,
+    pair: Pair,
+    hooks: { onActivity?: (kind: string, rel: string) => void; onScan?: (checked: number) => void } = {},
+) {
+    return new Mirror(client, pair.db, pair.local, { remoteRootUid: pair.remoteUid, trash: trashTarget(main), ...hooks });
 }
 
 /** Folder size before and after exclusions, for the "add folder" check. */
@@ -201,7 +206,7 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
     const mirrors = new Map<Pair, Mirror>();
 
     // Live progress for the app, written at most about once a second.
-    const progress = { startedMs: Date.now(), lastMs: 0, lastItem: '', folder: '' };
+    const progress = { startedMs: Date.now(), lastMs: 0, lastItem: '', folder: '', scanning: '', scanned: 0 };
     let lastWrite = 0;
     let pending: NodeJS.Timeout | undefined;
     const writeProgress = () => {
@@ -211,11 +216,18 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
         setMeta(main, 'progress', JSON.stringify({ ...progress, ...live }));
         notifyChanged();
     };
-    const onActivity = (folder: string) => (_kind: string, rel: string) => {
-        Object.assign(progress, { lastMs: Date.now(), lastItem: rel, folder });
+    const soon = () => {
         const wait = 1000 - (Date.now() - lastWrite);
         if (wait <= 0) writeProgress();
         else pending ??= setTimeout(() => ((pending = undefined), writeProgress()), wait);
+    };
+    const onActivity = (folder: string) => (_kind: string, rel: string) => {
+        Object.assign(progress, { lastMs: Date.now(), lastItem: rel, folder, scanning: '' });
+        soon();
+    };
+    const onScan = (folder: string) => (checked: number) => {
+        Object.assign(progress, { scanning: folder, scanned: checked });
+        soon();
     };
     const endProgress = () => {
         clearTimeout(pending);
@@ -237,7 +249,7 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
         const plans: { pair: Pair; plan: Plan }[] = [];
 
         for (const pair of pairs) {
-            const mirror = mirrorFor(client, main, pair, onActivity(pair.label));
+            const mirror = mirrorFor(client, main, pair, { onActivity: onActivity(pair.label), onScan: onScan(pair.label) });
             mirrors.set(pair, mirror);
             try {
                 await mirror.run({ full: opts.full });

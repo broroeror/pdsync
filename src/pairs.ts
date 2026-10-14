@@ -9,8 +9,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
-import { DeviceType, type ProtonDriveClient } from '@protontech/drive-sdk';
-import { getMeta, openState, setMeta, STATE_DIR } from './mirror.ts';
+import { DeviceType, DriveEventType, type ProtonDriveClient } from '@protontech/drive-sdk';
+import { getMeta, LAYOUT_VERSION, openState, setMeta, STATE_DIR } from './mirror.ts';
 
 export type Pair = {
     /** 'myfiles' for the original pair, otherwise a random id. */
@@ -127,8 +127,18 @@ export async function addPair(main: DatabaseSync, client: ProtonDriveClient, loc
         name,
         Date.now(),
     );
-    // The pair's own records; the folder is fixed for its lifetime.
-    setMeta(openState(path.join(PAIRS_DIR, `${id}.db`)), 'root_dir', local);
+    // The pair's own records; the folder is fixed for its lifetime. The Drive
+    // folder was just created empty, so there is nothing to scan there: start
+    // following Drive's changes from now on (the first sync only uploads).
+    const db = openState(path.join(PAIRS_DIR, `${id}.db`));
+    setMeta(db, 'root_dir', local);
+    for await (const event of client.iterateEvents(folder.treeEventScopeId)) {
+        if (event.type === DriveEventType.FastForward) {
+            setMeta(db, 'scope', folder.treeEventScopeId);
+            setMeta(db, 'event_id', event.eventId);
+            setMeta(db, 'layout', LAYOUT_VERSION);
+        }
+    }
     return { id, name, deviceName: device.name.ok ? device.name.value : os.hostname() };
 }
 
