@@ -77,6 +77,27 @@ class FakeDrive {
                 this.add({ uid, parentUid, name, type: 'folder' });
                 return this.entity(this.nodes.get(uid)!);
             },
+            moveNodes: async function* (this: FakeDrive, uids: string[], newParent: string) {
+                for (const uid of uids) {
+                    const n = this.nodes.get(uid)!;
+                    try {
+                        this.assertFreeName(newParent, n.name);
+                    } catch (error) {
+                        yield { uid, ok: false, error };
+                        continue;
+                    }
+                    n.parentUid = newParent;
+                    this.emit('node_updated', uid);
+                    yield { uid, ok: true };
+                }
+            }.bind(this),
+            renameNode: async (uid: string, name: string) => {
+                const n = this.nodes.get(uid)!;
+                this.assertFreeName(n.parentUid!, name);
+                n.name = name;
+                this.emit('node_updated', uid);
+                return this.entity(n);
+            },
             getFileUploader: async (parentUid: string, name: string) => ({
                 uploadFromStream: async (stream: ReadableStream<Uint8Array>) => ({
                     completion: async () => {
@@ -440,6 +461,7 @@ assert.equal(m.failures, 1);
 assert.match((db.prepare("SELECT detail FROM activity WHERE kind = 'failed' ORDER BY id DESC").get() as any).detail, /already has an item with this name/);
 assert.equal(drive.childNamed('root', 'taken.txt')!.content, 'on Drive', 'never overwritten');
 assert.ok(drive.childNamed('root', 'fine.txt'));
+await fs.rm(path.join(root, 'taken.txt')); // don't leave a clash for later tests
 console.log('✓ a name clash on Drive fails politely, others still upload');
 
 // A blocked plan (folder missing / empty) uploads nothing.
@@ -447,6 +469,69 @@ const countBefore = drive.nodes.size;
 await new Mirror(drive.client(), db, root).applyPlan({ items: [{ action: 'upload', rel: 'fine.txt', size: 4 }], held: [], blocked: 'unmounted' }, NEW);
 assert.equal(drive.nodes.size, countBefore);
 console.log('✓ a blocked plan uploads nothing');
+
+// 18. Moves and renames (stage 3), and things that depend on them.
+const { planForKinds } = await import('../src/plan.ts');
+const NEW_AND_MOVES = new Set(['new', 'moves'] as const);
+const push = async (kinds: Set<any> = NEW_AND_MOVES) => {
+    const mm = new Mirror(drive.client(), db, root);
+    await mm.run();
+    await mm.applyPlan(planForKinds(db, await planUploads(db, root), kinds), kinds);
+    return mm;
+};
+const pathOnDrive = (uid: string) => {
+    const parts: string[] = [];
+    for (let n = drive.nodes.get(uid); n && n.uid !== 'root'; n = drive.nodes.get(n.parentUid!)) parts.unshift(n.name);
+    return parts.join('/');
+};
+
+// The user's real case, in one go.
+drive.add({ uid: 'TF', parentUid: 'root', name: 'Test Folder', type: 'folder' });
+drive.add({ uid: 'TF1', parentUid: 'TF', name: 'song.mp3', type: 'file', rev: 's1', content: 'tune' });
+drive.add({ uid: 'TFD', parentUid: 'TF', name: 'Notes', type: 'file', rev: 'nd', content: '', mediaType: DOC });
+await run();
+await fs.mkdir(path.join(root, 'New Folder 2'));
+await fs.rename(path.join(root, 'Test Folder'), path.join(root, 'New Folder 2/Test Folder'));
+await fs.writeFile(path.join(root, 'New Folder 2/Test Folder/fresh.docx'), 'D');
+m = await push();
+assert.equal(m.failures, 0);
+assert.equal(pathOnDrive('TF'), 'New Folder 2/Test Folder');
+assert.equal(pathOnDrive('TF1'), 'New Folder 2/Test Folder/song.mp3', 'contents moved with the folder');
+assert.equal(drive.childNamed('TF', 'fresh.docx')?.content, 'D', 'uploaded into the moved folder');
+assert.ok(![...drive.nodes.values()].some((n) => n.name.endsWith('.desktop')), 'the shortcut never reached Drive');
+m = await run();
+assert.equal(m.downloaded, 0, 'nothing comes back down');
+assert.equal(await exists('Test Folder'), false, 'the old folder is not recreated');
+plan = await planUploads(db, root);
+assert.ok(!plan.items.some((i) => i.action === 'move' || ('rel' in i && i.rel.includes('Test Folder'))), 'in sync afterwards');
+console.log('✓ the real case: create, move a folder into it, upload into the moved folder');
+
+// A plain rename, and a file moved into another folder.
+await fs.rename(path.join(root, 'New Folder 2/Test Folder/song.mp3'), path.join(root, 'New Folder 2/Test Folder/song renamed.mp3'));
+await fs.rename(path.join(root, 'fine.txt'), path.join(root, 'New Folder 2/fine.txt'));
+m = await push();
+assert.equal(pathOnDrive('TF1'), 'New Folder 2/Test Folder/song renamed.mp3');
+assert.equal(drive.childNamed(drive.childNamed('root', 'New Folder 2')!.uid, 'fine.txt')?.content, 'fine');
+m = await run();
+assert.equal(m.downloaded, 0);
+console.log('✓ renames and moves of files carry over to Drive');
+
+// Moves stay off unless switched on: then the file just waits.
+await fs.rename(path.join(root, 'New Folder 2/fine.txt'), path.join(root, 'fine-again.txt'));
+await push(new Set(['new']));
+assert.ok(drive.childNamed(drive.childNamed('root', 'New Folder 2')!.uid, 'fine.txt'), 'not moved while moves are off');
+await push();
+assert.ok(drive.childNamed('root', 'fine-again.txt'));
+console.log('✓ moves only happen when switched on');
+
+// A move whose new name is taken on Drive fails politely; nothing local changes.
+drive.nodes.set('ghost2', { uid: 'ghost2', parentUid: 'root', name: 'occupied.txt', type: 'file', rev: 'x', content: 'Drive' });
+await fs.rename(path.join(root, 'fine-again.txt'), path.join(root, 'occupied.txt'));
+m = await push();
+assert.equal(m.failures, 1);
+assert.equal(await read('occupied.txt'), 'fine');
+assert.equal(drive.nodes.get('ghost2')!.content, 'Drive');
+console.log('✓ a move into a taken name fails politely');
 
 await fs.rm(scratch, { recursive: true, force: true });
 console.log('\nall mirror checks passed');

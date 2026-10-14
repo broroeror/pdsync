@@ -94,7 +94,7 @@ ColumnLayout {
                 width: ListView.view.width
                 hoverEnabled: false
                 readonly property var glyphs: ({
-                    download: ["↓", "#2a9d8f"], upload: ["↑", "#2a9d8f"], created: ["+", "#2a9d8f"], move: ["→", "#4a7fc1"], removed: ["✕", "#8a9499"],
+                    download: ["↓", "#2a9d8f"], upload: ["↑", "#2a9d8f"], created: ["+", "#2a9d8f"], move: ["→", "#4a7fc1"], moved: ["→", "#4a7fc1"], removed: ["✕", "#8a9499"],
                     skipped: ["!", "#e9a23b"], warning: ["!", "#e9a23b"], failed: ["✗", "#d64545"], resolved: ["✓", "#2a9d8f"]
                 })
                 contentItem: RowLayout {

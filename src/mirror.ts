@@ -19,7 +19,7 @@ import {
     type NodeEntity,
     type ProtonDriveClient,
 } from '@protontech/drive-sdk';
-import { kindOf, type Plan, type UploadKind } from './plan.ts';
+import { kindOf, type Plan, type PlanItem, type UploadKind } from './plan.ts';
 export { kindOf, type UploadKind };
 import { verbose } from './logging.ts';
 import { moveToTrash, trashTarget } from './trash.ts';
@@ -519,7 +519,11 @@ export class Mirror {
     /**
      * Carry out the planned changes of the given kinds on Drive. Only kinds the
      * user switched on are passed in; everything else in the plan is left.
-     * Stage 1: new folders and new files (nothing existing on Drive is touched).
+     *
+     * Changes can depend on each other (a folder must be moved before files
+     * are uploaded into it at its new place), so each pass carries out what is
+     * ready (its destination folder exists on Drive) and passes repeat until
+     * nothing more can happen. Anything still waiting is reported, not forced.
      */
     async applyPlan(plan: Plan, kinds: Set<UploadKind>) {
         if (plan.blocked) return;
@@ -532,11 +536,55 @@ export class Mirror {
                 | undefined;
             return row?.uid;
         };
-        for (const item of plan.items) {
-            if (!kinds.has(kindOf(item))) continue;
-            if (item.action === 'create-folder') await this.createFolder(item.rel, parentUid(item.rel));
-            else if (item.action === 'upload') await this.uploadNew(item.rel, parentUid(item.rel));
+        const destination = (item: PlanItem) => (item.action === 'move' ? item.to : item.rel);
+
+        let pending = plan.items.filter((i) => kinds.has(kindOf(i)));
+        while (pending.length) {
+            const waiting: PlanItem[] = [];
+            for (const item of pending) {
+                const parent = parentUid(destination(item));
+                if (!parent && item.action !== 'update' && item.action !== 'trash') {
+                    waiting.push(item);
+                    continue;
+                }
+                if (item.action === 'create-folder') await this.createFolder(item.rel, parent);
+                else if (item.action === 'upload') await this.uploadNew(item.rel, parent);
+                else if (item.action === 'move') await this.moveOnDrive(item, parent!);
+            }
+            if (waiting.length === pending.length) {
+                for (const item of waiting) {
+                    this.fail(destination(item), 'waiting', new Error(`its folder "${path.posix.dirname(destination(item))}" isn't on Drive`));
+                }
+                break;
+            }
+            pending = waiting;
         }
+    }
+
+    /** A local rename and/or move, carried out on Drive (move first, then rename). */
+    private async moveOnDrive(item: Extract<PlanItem, { action: 'move' }>, newParentUid: string) {
+        const label = (rel: string) => rel + (item.type === 'folder' ? '/' : '');
+        try {
+            if (path.posix.dirname(item.from) !== path.posix.dirname(item.to)) {
+                for await (const result of this.client.moveNodes([item.uid], newParentUid)) {
+                    if (!result.ok) throw result.error;
+                }
+            }
+            if (path.posix.basename(item.from) !== path.posix.basename(item.to)) {
+                await this.client.renameNode(item.uid, path.posix.basename(item.to));
+            }
+        } catch (error) {
+            return this.fail(label(item.to), 'moving on Drive', friendlyWriteError(error));
+        }
+        // Re-point sync's records (a folder's contents moved with it).
+        for (const table of ['nodes', 'review', 'leftovers']) {
+            const rows = this.db.prepare(`SELECT rel_path FROM ${table}`).all() as { rel_path: string }[];
+            const update = this.db.prepare(`UPDATE ${table} SET rel_path = ? WHERE rel_path = ?`);
+            for (const { rel_path } of rows) {
+                if (isUnder(rel_path, item.from)) update.run(item.to + rel_path.slice(item.from.length), rel_path);
+            }
+        }
+        this.record('moved', label(item.to), `${label(item.from)} → ${label(item.to)} on Drive`);
     }
 
     private async createFolder(rel: string, parent: string | undefined) {
@@ -920,7 +968,7 @@ export class Mirror {
     private record(kind: string, rel: string, detail?: string) {
         addActivity(this.db, kind, rel, detail);
         const symbol =
-            { download: '↓', upload: '↑', created: '+', move: '→', removed: '✕', skipped: '!', failed: '✗', warning: '!', resolved: '✓' }[kind] ??
+            { download: '↓', upload: '↑', created: '+', move: '→', moved: '→', removed: '✕', skipped: '!', failed: '✗', warning: '!', resolved: '✓' }[kind] ??
             '·';
         const line = kind === 'move' ? `${symbol} ${detail}  →  ${rel}` : `${symbol} ${rel}${detail ? `: ${detail}` : ''}`;
         (kind === 'failed' ? console.error : kind === 'skipped' || kind === 'warning' ? console.warn : console.log)(line);
