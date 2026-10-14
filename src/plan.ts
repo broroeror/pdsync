@@ -101,6 +101,22 @@ export async function planUploads(db: DatabaseSync, root: string): Promise<Plan>
         if (e && e.type === row.type) settle(row, row.rel_path, e);
     }
 
+    // Copies sync left behind and no longer tracks (see the leftovers table).
+    const leftovers = new Map(
+        (db.prepare('SELECT * FROM leftovers').all() as { rel_path: string; type: string; size: number | null; mtime_ms: number | null; reason: string }[]).map(
+            (l) => [l.rel_path, l],
+        ),
+    );
+    const leftoverWhy: Record<string, string> = {
+        'removed-on-drive': 'removed on Drive; kept here, not uploaded again',
+        'rename-clash': 'an old copy sync left behind after a rename on Drive; not uploaded',
+        'moved-on-drive': 'left behind when its folder moved on Drive; not uploaded',
+    };
+    const isLeftover = (e: LocalEntry) => {
+        const left = leftovers.get(e.rel);
+        return !!left && left.type === e.type && (e.type === 'folder' || (left.size === e.size && left.mtime_ms === e.mtimeMs));
+    };
+
     // 2. Missing from its place: moved/renamed (same disk identity), or deleted.
     const byIno = new Map<number, LocalEntry>();
     for (const e of local.values()) if (!claimed.has(e.rel)) byIno.set(e.ino, e);
@@ -109,12 +125,17 @@ export async function planUploads(db: DatabaseSync, root: string): Promise<Plan>
 
     for (const row of missing) {
         if (done.has(row.uid)) continue; // carried along with a moved folder
+        // Same disk identity = renamed. Filesystems can reuse a deleted file's
+        // inode, so a file must also still have the same size and mtime (a
+        // rename keeps both); a renamed-and-edited file becomes trash + upload,
+        // which is safe, just less efficient.
         let found = row.local_ino != null ? byIno.get(row.local_ino) : undefined;
-        if (found && (found.type !== row.type || claimed.has(found.rel))) found = undefined;
-        if (!found && row.type === 'file') {
-            // Older rows have no inode: accept a unique same-size, same-mtime newcomer.
+        if (found && (found.type !== row.type || claimed.has(found.rel) || isLeftover(found))) found = undefined;
+        if (found && row.type === 'file' && !matches(row, found)) found = undefined;
+        if (!found && row.type === 'file' && row.local_ino == null) {
+            // Rows recorded before inodes: accept a unique same-size, same-mtime newcomer.
             const candidates = [...local.values()].filter(
-                (e) => e.type === 'file' && !claimed.has(e.rel) && matches(row, e),
+                (e) => e.type === 'file' && !claimed.has(e.rel) && !isLeftover(e) && matches(row, e),
             );
             if (candidates.length === 1) found = candidates[0];
         }
@@ -157,12 +178,19 @@ export async function planUploads(db: DatabaseSync, root: string): Promise<Plan>
         plan.items.push(...trashItems);
     }
 
-    // 4. Everything else is new.
+    // 4. Everything else is new, except copies sync itself left behind.
+    const heldFolders: string[] = [];
     const fresh = [...local.values()]
         .filter((e) => !claimed.has(e.rel))
         .sort((a, b) => depth(a.rel) - depth(b.rel) || a.rel.localeCompare(b.rel));
     for (const e of fresh) {
-        if (reviewPaths.has(e.rel)) {
+        // Still exactly as sync left it (a file the user edits since becomes theirs).
+        if (isLeftover(e)) {
+            plan.held.push({ rel: e.rel, why: leftoverWhy[leftovers.get(e.rel)!.reason] ?? 'left behind by sync; not uploaded' });
+            if (e.type === 'folder') heldFolders.push(e.rel);
+        } else if (heldFolders.some((f) => isUnder(e.rel, f))) {
+            plan.held.push({ rel: e.rel, why: 'inside a folder that was removed or moved on Drive' });
+        } else if (reviewPaths.has(e.rel)) {
             plan.held.push({ rel: e.rel, why: 'waiting in Review' });
         } else if (e.type === 'folder') {
             plan.items.push({ action: 'create-folder', rel: e.rel });

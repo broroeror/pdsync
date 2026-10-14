@@ -221,5 +221,34 @@ const kinds = new Set((db.prepare('SELECT kind FROM activity').all() as any[]).m
 for (const k of ['download', 'move', 'removed', 'skipped', 'failed', 'resolved']) assert.ok(kinds.has(k), `missing ${k}`);
 console.log('✓ activity recorded');
 
+// 14. Copies sync stops tracking are remembered as leftovers, and the upload
+// planner holds them instead of uploading them back.
+const { planUploads } = await import('../src/plan.ts');
+const leftovers = () => (db.prepare('SELECT rel_path, reason FROM leftovers ORDER BY rel_path').all() as any[]).map((r) => `${r.rel_path}:${r.reason}`);
+drive.add({ uid: 'h', parentUid: 'root', name: 'drive-deletes-me.txt', type: 'file', rev: 'h1', content: 'H' });
+await run();
+drive.update('h', { trashed: true });
+await run();
+assert.ok(leftovers().includes('drive-deletes-me.txt:removed-on-drive'));
+let plan = await planUploads(db, root);
+assert.ok(!plan.items.some((i) => i.action === 'upload' && i.rel === 'drive-deletes-me.txt'), 'must not re-upload a Drive deletion');
+assert.ok(plan.held.some((h) => h.rel === 'drive-deletes-me.txt'));
+// Edited afterwards, it's the user's own file again: upload it.
+await fs.writeFile(path.join(root, 'drive-deletes-me.txt'), 'H, but I kept working on it');
+plan = await planUploads(db, root);
+assert.ok(plan.items.some((i) => i.action === 'upload' && i.rel === 'drive-deletes-me.txt'));
+console.log('✓ Drive deletions are not re-uploaded (unless edited afterwards)');
+
+// A rename on Drive into a name that's taken leaves the old copy as a leftover.
+drive.add({ uid: 'k', parentUid: 'root', name: 'k-old.txt', type: 'file', rev: 'k1', content: 'K' });
+await run();
+await fs.writeFile(path.join(root, 'k-new.txt'), 'unrelated local file');
+drive.update('k', { name: 'k-new.txt' });
+await run();
+assert.ok(leftovers().includes('k-old.txt:rename-clash'));
+plan = await planUploads(db, root);
+assert.ok(!plan.items.some((i) => i.action === 'upload' && i.rel === 'k-old.txt'));
+console.log('✓ a copy left behind by a rename clash is not uploaded');
+
 await fs.rm(scratch, { recursive: true, force: true });
 console.log('\nall mirror checks passed');

@@ -131,6 +131,16 @@ await fs.rename(abs('old-row.txt'), abs('old-row-renamed.txt'));
 assert.deepEqual(await summary(), ['move old-row.txt -> old-row-renamed.txt']);
 console.log('✓ rename detected for rows recorded before inodes');
 
+// 9b. Renamed *and* edited: not trusted as a rename (inodes can be reused),
+// so it's the safe pair: old one to trash, new one uploaded.
+await reset();
+await synced('draft.txt', 'v1');
+await synced('other.txt', 'O');
+await fs.rename(abs('draft.txt'), abs('final.txt'));
+await fs.appendFile(abs('final.txt'), ' and more');
+assert.deepEqual(await summary(), ['upload final.txt', 'trash draft.txt (1)']);
+console.log('✓ renamed + edited becomes trash + upload, never a bogus rename');
+
 // 10. A missing or empty folder blocks everything (unmounted drive).
 await reset();
 await synced('a.txt', 'A');

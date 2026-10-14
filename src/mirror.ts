@@ -6,7 +6,7 @@
 //  - Writes atomically: download to a hidden part file, then rename.
 //  - On any failure the event cursor is not advanced, so the next run retries.
 import { once } from 'node:events';
-import { createWriteStream, mkdirSync } from 'node:fs';
+import { createWriteStream, mkdirSync, statSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -76,6 +76,18 @@ export function openState() {
             time_ms INTEGER NOT NULL,
             -- 1 = "keep mine" for this Drive revision: stay quiet until Drive changes again.
             dismissed INTEGER NOT NULL DEFAULT 0
+        );
+    `);
+    // Local copies sync left behind and no longer tracks, so the upload planner
+    // doesn't mistake them for new files of the user's.
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS leftovers (
+            rel_path TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            size INTEGER,
+            mtime_ms INTEGER,
+            reason TEXT NOT NULL,    -- removed-on-drive | rename-clash | moved-on-drive
+            time_ms INTEGER NOT NULL
         );
     `);
     // Added later: the Drive version's details, shown next to the local file.
@@ -360,12 +372,13 @@ export class Mirror {
         // The new name is taken by another local file: leave both alone and
         // treat the Drive file as new (it will go to review, not overwrite).
         this.warn(`${row.rel_path}: renamed on Drive to ${rel}, but a local file already has that name; left as is`);
+        this.leaveBehind([row], 'rename-clash');
         this.db.prepare('DELETE FROM nodes WHERE uid = ?').run(row.uid);
         return undefined;
     }
 
     private async moveFolder(oldRel: string, rel: string) {
-        const descendants = (this.db.prepare('SELECT uid, rel_path FROM nodes').all() as Row[]).filter((r) =>
+        const descendants = (this.db.prepare('SELECT * FROM nodes').all() as Row[]).filter((r) =>
             isUnder(r.rel_path, oldRel),
         );
         if ((await statOrNull(this.abs(oldRel))) && !(await statOrNull(this.abs(rel)))) {
@@ -382,6 +395,7 @@ export class Mirror {
         }
         // Can't move it cleanly: forget its contents so a rescan re-fetches
         // them into the new location; the old local folder is left untouched.
+        this.leaveBehind(descendants, 'moved-on-drive');
         const forget = this.db.prepare('DELETE FROM nodes WHERE uid = ?');
         for (const r of descendants) forget.run(r.uid);
         this.needsRescan = true;
@@ -391,13 +405,17 @@ export class Mirror {
         const row = this.getRow(uid);
         if (!row) return;
         const forget = this.db.prepare('DELETE FROM nodes WHERE uid = ?');
+        const affected = [row];
         if (row.type === 'folder') {
-            for (const r of this.db.prepare('SELECT uid, rel_path FROM nodes').all() as Row[]) {
-                if (isUnder(r.rel_path, row.rel_path)) {
-                    forget.run(r.uid);
-                    this.clearReview(r.uid);
-                }
+            for (const r of this.db.prepare('SELECT * FROM nodes').all() as Row[]) {
+                if (r.uid !== row.uid && isUnder(r.rel_path, row.rel_path)) affected.push(r);
             }
+        }
+        this.leaveBehind(affected, 'removed-on-drive');
+        for (const r of affected) {
+            if (r.uid === uid) continue;
+            forget.run(r.uid);
+            this.clearReview(r.uid);
         }
         forget.run(uid);
         this.clearReview(uid);
@@ -442,6 +460,8 @@ export class Mirror {
                      local_ino = COALESCE(excluded.local_ino, nodes.local_ino)`,
             )
             .run(r.uid, r.type, r.rel_path, r.revision_uid, r.local_size, r.local_mtime_ms, r.local_ino ?? null);
+        // Sync owns this path again.
+        this.db.prepare('DELETE FROM leftovers WHERE rel_path = ?').run(r.rel_path);
     }
 
     private needsReview(
@@ -486,6 +506,26 @@ export class Mirror {
             this.db
                 .prepare('UPDATE review SET drive_mtime_ms = ?, drive_size = ? WHERE uid = ?')
                 .run((revision?.claimedModificationTime ?? node.modificationTime).getTime(), revision?.claimedSize ?? null, uid);
+        }
+    }
+
+    /** Remember local copies sync stops tracking (unedited files, and folders). */
+    private leaveBehind(rows: Row[], reason: 'removed-on-drive' | 'rename-clash' | 'moved-on-drive') {
+        const insert = this.db.prepare(
+            `INSERT INTO leftovers (rel_path, type, size, mtime_ms, reason, time_ms) VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(rel_path) DO UPDATE SET type = excluded.type, size = excluded.size,
+                 mtime_ms = excluded.mtime_ms, reason = excluded.reason, time_ms = excluded.time_ms`,
+        );
+        for (const r of rows) {
+            let stat;
+            try {
+                stat = statSync(this.abs(r.rel_path));
+            } catch {
+                continue; // Already gone locally.
+            }
+            // An edited file is the user's own work, not a leftover.
+            if (r.type === 'file' && !this.matches(r, stat)) continue;
+            insert.run(r.rel_path, r.type, r.type === 'file' ? stat.size : null, r.type === 'file' ? Math.trunc(stat.mtimeMs) : null, reason, Date.now());
         }
     }
 
