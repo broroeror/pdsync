@@ -16,6 +16,7 @@ class FakeDrive {
     events: any[] = [];
     failDownloads = false;
     trashCalls: string[] = [];
+    devices: any[] = [];
     seq = 0;
 
     constructor() {
@@ -92,6 +93,16 @@ class FakeDrive {
                     yield { uid, ok: true };
                 }
             }.bind(this),
+            iterateDevices: async function* (this: FakeDrive) {
+                yield* this.devices;
+            }.bind(this),
+            createDevice: async (name: string) => {
+                const rootUid = `devroot${++this.seq}`;
+                this.nodes.set(rootUid, { uid: rootUid, name, type: 'folder' }); // a root: no parent
+                const device = { uid: `dev${this.seq}`, name: { ok: true, value: name }, rootFolderUid: rootUid };
+                this.devices.push(device);
+                return device;
+            },
             trashNodes: async function* (this: FakeDrive, uids: string[]) {
                 for (const uid of uids) {
                     this.trashCalls.push(uid);
@@ -630,6 +641,58 @@ await m.run();
 await m.applyPlan(planForKinds(db, await planUploads(db, root, { allowMassDelete: true }), WITH_DELETES), WITH_DELETES);
 assert.ok(drive.nodes.get('BULK')!.trashed);
 console.log("✓ a confirmed mass deletion goes to Drive's trash");
+
+// 21. Folders from this computer (pairs under Computers → <this PC>).
+const { addPair, checkNewLocal, listPairs, removePair } = await import('../src/pairs.ts');
+const os2 = await import('node:os');
+const docs = path.join(scratch, 'Documents');
+const docs2 = path.join(scratch, 'Other', 'Documents');
+await fs.mkdir(path.join(docs, 'sub'), { recursive: true });
+await fs.mkdir(docs2, { recursive: true });
+await fs.writeFile(path.join(docs, 'a.txt'), 'A doc');
+await fs.writeFile(path.join(docs, 'sub/b.txt'), 'B doc');
+await fs.writeFile(path.join(docs2, 'c.txt'), 'C doc');
+const client = drive.client();
+const first = await addPair(db, client, docs);
+const second = await addPair(db, client, docs2);
+assert.equal(drive.devices.length, 1, 'one device for this computer, reused');
+assert.equal(drive.devices[0].name.value, os2.hostname());
+assert.deepEqual([first.name, second.name], ['Documents', 'Documents (2)']);
+assert.match(checkNewLocal(db, path.join(docs, 'sub')) ?? '', /overlaps/);
+assert.match(checkNewLocal(db, root) ?? '', /overlaps/);
+assert.match(checkNewLocal(db, os2.homedir()) ?? '', /Refusing/);
+const pairs = listPairs(db);
+assert.deepEqual(pairs.map((p) => p.label), ['My Files', 'Documents', 'Documents (2)']);
+console.log('✓ adding folders: one device, unique names on Drive, overlaps refused');
+
+const docsPair = pairs[1];
+const pairMirror = () => new Mirror(client, docsPair.db, docsPair.local, { remoteRootUid: docsPair.remoteUid, trash: { kind: 'folder', dir: trashDir } });
+m = pairMirror();
+await m.run();
+await m.applyPlan(planForKinds(docsPair.db, await planUploads(docsPair.db, docsPair.local), WITH_DELETES), WITH_DELETES);
+const docsFolder = docsPair.remoteUid!;
+assert.equal(drive.childNamed(docsFolder, 'a.txt')?.content, 'A doc');
+assert.equal(drive.childNamed(drive.childNamed(docsFolder, 'sub')!.uid, 'b.txt')?.content, 'B doc');
+m = pairMirror();
+await m.run();
+assert.equal(m.downloaded, 0, 'own uploads not downloaded back');
+m = await run();
+assert.equal(await exists('a.txt'), false, 'My Files never picks up computer folders');
+assert.equal(m.downloaded, 0);
+console.log('✓ a computer folder uploads into its own place on Drive, separate from My Files');
+
+drive.add({ uid: 'FROMWEB', parentUid: docsFolder, name: 'from-the-web.txt', type: 'file', rev: 'fromweb-r1', content: 'hello from Drive' });
+drive.add({ uid: 'MYFILESONLY', parentUid: 'root', name: 'myfiles-only.txt', type: 'file', rev: 'myfilesonly-r1', content: 'mine' });
+m = pairMirror();
+await m.run();
+assert.equal(await fs.readFile(path.join(docs, 'from-the-web.txt'), 'utf8'), 'hello from Drive');
+assert.equal(await fs.stat(path.join(docs, 'myfiles-only.txt')).then(() => true, () => false), false, 'pair ignores My Files changes');
+console.log('✓ Drive-side changes reach the right folder only');
+
+removePair(db, docs2);
+assert.deepEqual(listPairs(db).map((p) => p.label), ['My Files', 'Documents']);
+assert.equal(await fs.readFile(path.join(docs2, 'c.txt'), 'utf8'), 'C doc', 'local files stay');
+console.log('✓ removing a folder stops syncing it; its files stay');
 
 await fs.rm(scratch, { recursive: true, force: true });
 console.log('\nall mirror checks passed');

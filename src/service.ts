@@ -10,7 +10,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { DatabaseSync } from 'node:sqlite';
-import { getMeta } from './mirror.ts';
 import { UserError } from './session.ts';
 
 // Defined by the bundler for the installed build.
@@ -83,9 +82,6 @@ function writeSourceUnits(intervalMinutes: number) {
 }
 
 export function installService(db: DatabaseSync, intervalMinutes = DEFAULT_INTERVAL_MINUTES) {
-    if (!getMeta(db, 'root_dir') || !getMeta(db, 'event_id')) {
-        throw new UserError('Run a first mirror before turning on automatic sync, so the folder is known.');
-    }
     if (!Number.isInteger(intervalMinutes) || intervalMinutes < 1) {
         throw new UserError('The interval must be a whole number of minutes, at least 1.');
     }

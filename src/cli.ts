@@ -1,162 +1,224 @@
 // Entry point: npm run pdsync -- <command>
 // Commands that the desktop app uses take --json for machine-readable output.
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
+import type { ProtonDriveClient } from '@protontech/drive-sdk';
 import { ApiError } from './api.ts';
 import { acquireLock, lockHolder } from './lock.ts';
-import { randomUUID } from 'node:crypto';
 import { finishRun, getMeta, Mirror, openState, setMeta, startRun, STATE_DIR, type UploadKind } from './mirror.ts';
-import { ask } from './prompt.ts';
+import { addPair, checkNewLocal, listPairs, removePair, type Pair } from './pairs.ts';
 import { planForKinds, planUploads, type Plan } from './plan.ts';
-import { describeTrash, prepareTrashFolder, trashTarget } from './trash.ts';
+import { ask } from './prompt.ts';
 import { installService, serviceInfo, serviceStatus, uninstallService } from './service.ts';
 import { AuthError, interactiveLogin, logout, machineLogin, openClient, savedUsername, UserError } from './session.ts';
+import { describeTrash, prepareTrashFolder, trashTarget } from './trash.ts';
 
 const USAGE = `Usage: npm run pdsync -- <command>
 
   login               Log in once; the login is saved in your desktop keyring
   logout              Sign out and remove the saved login
   ls                  List the top level of My Files
-  mirror [folder]     Download My Files into a folder (download-only: never
-                      deletes or uploads). The folder is remembered after the
-                      first run. Add --full to rescan everything.
+  mirror [folder]     Sync every folder pair: catch up with Drive, then upload
+                      the kinds of local change switched on (config uploads).
+                      [folder] sets My Files' local folder on first run.
+                      Add --full to rescan everything.
+  folders             List synced folders
+  folders add <dir>   Sync a folder from this computer (it appears under
+                      Computers on Drive)
+  folders remove <dir|id>
+                      Stop syncing a folder (its files stay, here and on Drive)
   plan                Dry run of uploading: sync with Drive, then list what
                       would change on Drive. Changes nothing on Drive.
   push <kinds> [--yes]
-                      Upload now, after showing what and asking (kinds: new, edits,
-                      moves, deletes, all). --allow-many confirms a held
-                      mass deletion.
+                      Upload now, after showing what and asking (kinds: new,
+                      edits, moves, deletes, all). --allow-many confirms a
+                      held mass deletion.
   restore-deleted     Download again the files whose mass deletion was held
-  config uploads <kinds>|none
-                      Which kinds of local change automatic runs upload
-                      (off until you switch them on)
-  status              Login, folder, last run, automatic sync
-  activity            Recent downloads, moves, removals and warnings
-  review              Files the mirror skipped and why
+  status              Login, folders, last run, automatic sync
+  activity            Recent downloads, uploads, moves, removals and warnings
+  review              Files sync skipped and why
   resolve <id> keep-local|keep-both
                       Decide about a skipped file (keep-both renames your local
                       file aside, then fetches the Drive version)
-  config folder <dir> Mirror into a different folder from now on (the old
-                      folder and its files are left as they are)
+  config folder <dir> Mirror My Files into a different folder from now on
+                      (the old folder and its files are left as they are)
+  config uploads <kinds>|none
+                      Which kinds of local change automatic runs upload
+                      (off until you switch them on)
   config trash desktop|<dir>
                       Where your copy goes when a file is deleted on Drive:
                       the desktop trash (default) or a folder you choose
   service install [minutes]
-                      Run the mirror automatically (default every 5 minutes)
+                      Run sync automatically (default every 5 minutes)
   service status      Show when it runs next
   service uninstall   Stop running it automatically
 
-Add --json to status, activity and review for machine-readable output.`;
+Add --json to status, folders, activity and review for machine-readable output.`;
 
 /** The desktop app watches this file to know when to refresh. */
 function notifyChanged() {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
     fs.writeFileSync(path.join(STATE_DIR, 'changed'), String(Date.now()));
 }
 
-function checkFolder(folder: string) {
+const overlaps = (a: string, b: string) => a === b || a.startsWith(b + '/') || b.startsWith(a + '/');
+
+function checkMyFilesFolder(main: DatabaseSync, folder: string) {
     if (folder === path.parse(folder).root || folder === os.homedir()) {
         throw new UserError(`Refusing to mirror straight into ${folder}; pick a dedicated folder.`);
+    }
+    for (const p of listPairs(main)) {
+        if (p.kind === 'computer' && overlaps(folder, p.local)) {
+            throw new UserError(`That folder overlaps one that's already synced (${p.local}).`);
+        }
     }
 }
 
 const UPLOAD_KINDS: UploadKind[] = ['new', 'edits', 'moves', 'deletes'];
-// Built so far; the rest are refused until they exist.
-const AVAILABLE_KINDS = new Set<UploadKind>(['new', 'edits', 'moves', 'deletes']);
 
 /** Upload kinds switched on for automatic runs. */
-function enabledKinds(db: DatabaseSync) {
-    return new Set((getMeta(db, 'uploads') ?? '').split(',').filter((k): k is UploadKind => AVAILABLE_KINDS.has(k as UploadKind)));
+function enabledKinds(main: DatabaseSync) {
+    return new Set((getMeta(main, 'uploads') ?? '').split(',').filter((k): k is UploadKind => UPLOAD_KINDS.includes(k as UploadKind)));
 }
 
 function parseKinds(words: string[]) {
     const kinds = new Set<UploadKind>();
     for (const w of words) {
-        if (w === 'all') AVAILABLE_KINDS.forEach((k) => kinds.add(k));
-        else if (!UPLOAD_KINDS.includes(w as UploadKind)) throw new UserError(`Unknown kind "${w}" (use: ${UPLOAD_KINDS.join(', ')})`);
-        else if (!AVAILABLE_KINDS.has(w as UploadKind)) throw new UserError(`Uploading "${w}" isn't built yet (available: ${[...AVAILABLE_KINDS].join(', ')})`);
+        if (w === 'all') UPLOAD_KINDS.forEach((k) => kinds.add(k));
+        else if (!UPLOAD_KINDS.includes(w as UploadKind)) throw new UserError(`Unknown kind "${w}" (use: ${UPLOAD_KINDS.join(', ')}, all)`);
         else kinds.add(w as UploadKind);
     }
     return kinds;
 }
 
-async function openMirror(db: DatabaseSync, folder: string) {
-    let clientUid = getMeta(db, 'client_uid');
-    if (!clientUid) setMeta(db, 'client_uid', (clientUid = randomUUID()));
+/** Log in from the keyring; one client serves every pair. */
+async function openSession(main: DatabaseSync) {
+    let clientUid = getMeta(main, 'client_uid');
+    if (!clientUid) setMeta(main, 'client_uid', (clientUid = randomUUID()));
     const { client, username } = await openClient(clientUid);
-    const account = getMeta(db, 'account');
+    const account = getMeta(main, 'account');
     if (account && account !== username) {
-        throw new UserError(`This mirror belongs to ${account}. To mirror ${username}, choose a new folder first (config folder).`);
+        throw new UserError(`This sync belongs to ${account}. To sync ${username}, choose a new My Files folder first (config folder).`);
     }
-    setMeta(db, 'account', username);
-    return new Mirror(client, db, folder);
+    setMeta(main, 'account', username);
+    return client;
 }
 
-async function runMirror(
-    db: DatabaseSync,
-    given: string | undefined,
-    full: boolean,
-    // Upload kinds to carry out after catching up; default: those switched on.
-    // `confirm` sees the items first and may cancel.
-    upload: { kinds?: Set<UploadKind>; confirm?: (plan: Plan) => Promise<boolean>; allowMassDelete?: boolean } = {},
-) {
-    const folder = given ? path.resolve(given) : getMeta(db, 'root_dir');
-    if (!folder) throw new UserError('First run: say which folder to mirror into, e.g.  npm run pdsync -- mirror ~/DriveMirror');
-    checkFolder(folder);
-    acquireLock(STATE_DIR);
+function mirrorFor(client: ProtonDriveClient, main: DatabaseSync, pair: Pair) {
+    return new Mirror(client, pair.db, pair.local, { remoteRootUid: pair.remoteUid, trash: trashTarget(main) });
+}
 
-    const runId = startRun(db);
+function pairById(main: DatabaseSync, id: string) {
+    const pair = listPairs(main).find((p) => p.id === id);
+    if (!pair) throw new UserError('That synced folder no longer exists.');
+    return pair;
+}
+
+type UploadOptions = {
+    // Kinds to carry out after catching up; default: those switched on.
+    kinds?: Set<UploadKind>;
+    // Sees every pair's plan first, and may cancel all of them.
+    confirm?: (plans: { pair: Pair; plan: Plan }[]) => Promise<boolean>;
+    allowMassDelete?: boolean;
+};
+
+/**
+ * One sync run over every pair: catch up with Drive, then upload. A problem
+ * in one pair is reported and the others still run; a login problem stops all.
+ */
+async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptions = {}) {
+    const pairs = listPairs(main);
+    if (!pairs.length) {
+        throw new UserError('Nothing to sync yet: set a My Files folder (mirror <folder>) or add one (folders add <dir>).');
+    }
+    acquireLock(STATE_DIR);
+    const runId = startRun(main);
     notifyChanged();
-    let mirror: Mirror | undefined;
+    const totals = { downloaded: 0, uploaded: 0, trashedOnDrive: 0, trashed: 0, skipped: 0, failures: 0 };
+    const errors: string[] = [];
+    const mirrors = new Map<Pair, Mirror>();
+    const add = (m: Mirror) => {
+        totals.downloaded += m.downloaded;
+        totals.uploaded += m.uploaded;
+        totals.trashedOnDrive += m.trashedOnDrive;
+        totals.trashed += m.trashed;
+        totals.skipped += m.skipped;
+        totals.failures += m.failures;
+    };
+
     try {
-        mirror = await openMirror(db, folder);
-        await mirror.run({ full });
-        const kinds = upload.kinds ?? enabledKinds(db);
-        if (kinds.size && !mirror.failures) {
-            const full = await planUploads(db, folder, { allowMassDelete: upload.allowMassDelete });
-            // Remember held mass deletions so the app can ask about them.
-            const held = kinds.has('deletes') ? (full.massDelete?.files ?? 0) : 0;
-            if (String(held) !== (getMeta(db, 'mass_delete_held') ?? '0')) {
-                setMeta(db, 'mass_delete_held', String(held));
-                if (held) console.log(`${held} files were deleted here at once; they were NOT deleted on Drive. Confirm with: push deletes --allow-many, or undo with: restore-deleted`);
-            }
-            const plan = planForKinds(db, full, kinds);
-            if (plan.blocked) console.log(plan.blocked);
-            if (plan.items.length && (!upload.confirm || (await upload.confirm(plan)))) {
-                await mirror.applyPlan(plan, kinds);
-            } else if (!plan.items.length && upload.confirm) {
-                printPlan({ items: [], held: plan.held }, 'Will');
-                console.log('\nNothing of that kind to upload right now.');
+        const client = await openSession(main);
+        const kinds = opts.kinds ?? enabledKinds(main);
+        const plans: { pair: Pair; plan: Plan }[] = [];
+
+        for (const pair of pairs) {
+            const mirror = mirrorFor(client, main, pair);
+            mirrors.set(pair, mirror);
+            try {
+                await mirror.run({ full: opts.full });
+                if (!kinds.size || mirror.failures) continue;
+                const full = await planUploads(pair.db, pair.local, { allowMassDelete: opts.allowMassDelete });
+                // Remember held mass deletions so the app can ask about them.
+                const held = kinds.has('deletes') ? (full.massDelete?.files ?? 0) : 0;
+                if (String(held) !== (getMeta(pair.db, 'mass_delete_held') ?? '0')) {
+                    setMeta(pair.db, 'mass_delete_held', String(held));
+                    if (held) {
+                        console.log(
+                            `${pair.label}: ${held} files were deleted here at once; they were NOT deleted on Drive. ` +
+                                'Confirm with: push deletes --allow-many, or undo with: restore-deleted',
+                        );
+                    }
+                }
+                const plan = planForKinds(pair.db, full, kinds);
+                if (plan.blocked) console.log(`${pair.label}: ${plan.blocked}`);
+                plans.push({ pair, plan });
+            } catch (error) {
+                if (error instanceof AuthError || (error instanceof ApiError && error.status === 401)) throw error;
+                totals.failures++;
+                errors.push(`${pair.label}: ${error instanceof Error ? error.message : String(error)}`);
+                console.error(`✗ ${pair.label}: ${error instanceof Error ? error.message : String(error)}`);
             }
         }
+
+        const work = plans.filter((p) => p.plan.items.length);
+        if (opts.confirm && !work.length) {
+            printPlans(plans, 'Will');
+            console.log('\nNothing of that kind to upload right now.');
+        } else if (work.length && (!opts.confirm || (await opts.confirm(plans)))) {
+            for (const { pair, plan } of work) await mirrors.get(pair)!.applyPlan(plan, kinds);
+        }
     } catch (error) {
+        for (const m of mirrors.values()) add(m);
         const auth = error instanceof AuthError || (error instanceof ApiError && error.status === 401);
-        finishRun(db, runId, {
-            downloaded: mirror?.downloaded ?? 0,
-            skipped: mirror?.skipped ?? 0,
-            failures: (mirror?.failures ?? 0) + 1,
+        finishRun(main, runId, {
+            ...totals,
+            failures: totals.failures + 1,
             errorKind: auth ? 'auth' : 'other',
             error: error instanceof Error ? error.message : String(error),
         });
         notifyChanged();
         throw error;
     }
-    finishRun(db, runId, mirror);
+    for (const m of mirrors.values()) add(m);
+    finishRun(main, runId, { ...totals, error: errors.length ? errors.join('; ') : undefined, errorKind: errors.length ? 'other' : undefined });
     notifyChanged();
 
-    const parts = [`${mirror.downloaded} downloaded`];
-    if (mirror.uploaded) parts.push(`${mirror.uploaded} uploaded`);
-    if (mirror.trashedOnDrive) parts.push(`${mirror.trashedOnDrive} moved to Drive's trash`);
-    if (mirror.trashed) parts.push(`${mirror.trashed} moved to trash (deleted on Drive)`);
-    if (mirror.skipped) parts.push(`${mirror.skipped} skipped (see: review)`);
-    if (mirror.failures) parts.push(`${mirror.failures} failed; they will be retried next run`);
-    console.log(`\nMirror at ${folder}: ${parts.join(', ')}.`);
-    if (mirror.failures) process.exitCode = 1;
+    const parts = [`${totals.downloaded} downloaded`];
+    if (totals.uploaded) parts.push(`${totals.uploaded} uploaded`);
+    if (totals.trashedOnDrive) parts.push(`${totals.trashedOnDrive} moved to Drive's trash`);
+    if (totals.trashed) parts.push(`${totals.trashed} moved to trash (deleted on Drive)`);
+    if (totals.skipped) parts.push(`${totals.skipped} skipped (see: review)`);
+    if (totals.failures) parts.push(`${totals.failures} failed; they will be retried next run`);
+    const where = pairs.length === 1 ? pairs[0].local : `${pairs.length} folders`;
+    console.log(`\nSynced ${where}: ${parts.join(', ')}.`);
+    if (totals.failures) process.exitCode = 1;
 }
 
-function printPlan(plan: Plan, verb: 'Would' | 'Will' = 'Would') {
-    if (plan.blocked) return console.log(`\n${plan.blocked}`);
+function printPlan(plan: Plan, verb: 'Would' | 'Will', indent = '') {
+    if (plan.blocked) return console.log(`${indent}${plan.blocked}`);
     const size = (n: number) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`);
     const groups: [string, string[]][] = [
         [`${verb} create on Drive`, plan.items.flatMap((i) => (i.action === 'create-folder' ? [`+ ${i.rel}/`] : []))],
@@ -169,23 +231,42 @@ function printPlan(plan: Plan, verb: 'Would' | 'Will' = 'Would') {
         ],
         ['Held back', plan.held.map((h) => `· ${h.rel ? `${h.rel}: ` : ''}${h.why}`)],
     ];
-    console.log('');
-    if (!plan.items.length && !plan.held.length) return console.log('Nothing to upload: Drive already matches your folder.');
+    if (!plan.items.length && !plan.held.length) return console.log(`${indent}Nothing to upload: Drive already matches this folder.`);
     for (const [title, lines] of groups) {
         if (!lines.length) continue;
-        console.log(`${title}:`);
-        for (const line of lines) console.log(`  ${line}`);
+        console.log(`${indent}${title}:`);
+        for (const line of lines) console.log(`${indent}  ${line}`);
+    }
+}
+
+/** Plans for one or more pairs; headed by folder when there are several. */
+function printPlans(plans: { pair: Pair; plan: Plan }[], verb: 'Would' | 'Will') {
+    console.log('');
+    for (const { pair, plan } of plans) {
+        if (plans.length > 1) console.log(`── ${pair.label}  (${pair.local})`);
+        printPlan(plan, verb, plans.length > 1 ? '  ' : '');
     }
     if (verb === 'Would') console.log('\nThis was a dry run: nothing was changed on Drive.');
 }
 
-async function status(db: DatabaseSync) {
-    const lastRun = db.prepare('SELECT * FROM runs WHERE finished_ms IS NOT NULL ORDER BY id DESC LIMIT 1').get() as any;
-    const reviewCount = (db.prepare('SELECT COUNT(*) AS n FROM review WHERE dismissed = 0').get() as any).n;
+async function status(main: DatabaseSync) {
+    const lastRun = main.prepare('SELECT * FROM runs WHERE finished_ms IS NOT NULL ORDER BY id DESC LIMIT 1').get() as any;
+    const pairs = listPairs(main);
+    const reviewCount = (db: DatabaseSync) => (db.prepare('SELECT COUNT(*) AS n FROM review WHERE dismissed = 0').get() as any).n as number;
     return {
         username: await savedUsername(),
-        folder: getMeta(db, 'root_dir') ?? null,
-        firstSyncDone: !!getMeta(db, 'event_id'),
+        // My Files' local folder (kept for older app versions).
+        folder: getMeta(main, 'root_dir') ?? null,
+        firstSyncDone: pairs.length > 0 && pairs.every((p) => !!getMeta(p.db, 'event_id')),
+        folders: pairs.map((p) => ({
+            id: p.id,
+            kind: p.kind,
+            label: p.label,
+            local: p.local,
+            firstSyncDone: !!getMeta(p.db, 'event_id'),
+            reviewCount: reviewCount(p.db),
+        })),
+        computerName: os.hostname(),
         running: lockHolder(STATE_DIR) !== null,
         lastRun: lastRun
             ? {
@@ -197,10 +278,10 @@ async function status(db: DatabaseSync) {
                   error: lastRun.error,
               }
             : null,
-        reviewCount,
-        trash: trashTarget(db),
-        uploads: [...enabledKinds(db)],
-        massDeleteHeld: Number(getMeta(db, 'mass_delete_held') ?? 0),
+        reviewCount: pairs.reduce((n, p) => n + reviewCount(p.db), 0),
+        trash: trashTarget(main),
+        uploads: [...enabledKinds(main)],
+        massDeleteHeld: pairs.reduce((n, p) => n + Number(getMeta(p.db, 'mass_delete_held') ?? 0), 0),
         service: serviceInfo(),
     };
 }
@@ -211,13 +292,13 @@ async function main(command: string | undefined, args: string[]) {
 
     switch (command) {
         case 'login':
-            if (json) return machineLogin().finally(() => fs.existsSync(STATE_DIR) && notifyChanged());
+            if (json) return machineLogin().finally(() => notifyChanged());
             await interactiveLogin();
-            if (fs.existsSync(STATE_DIR)) notifyChanged();
+            notifyChanged();
             return;
         case 'logout':
             await logout();
-            if (fs.existsSync(STATE_DIR)) notifyChanged();
+            notifyChanged();
             return;
         case 'ls': {
             const { client } = await openClient();
@@ -228,19 +309,65 @@ async function main(command: string | undefined, args: string[]) {
             }
             return;
         }
-        case 'mirror':
-            return runMirror(openState(), positional[0], args.includes('--full'));
+        case 'mirror': {
+            const main = openState();
+            if (positional[0]) {
+                const folder = path.resolve(positional[0]);
+                const current = getMeta(main, 'root_dir');
+                if (current && current !== folder) {
+                    throw new UserError(`My Files already syncs with ${current}; to change it use: config folder <dir>`);
+                }
+                checkMyFilesFolder(main, folder);
+                setMeta(main, 'root_dir', folder);
+            }
+            return runAll(main, { full: args.includes('--full') });
+        }
+        case 'folders': {
+            const main = openState();
+            const [action, target] = positional;
+            if (action === 'add') {
+                if (!target) throw new UserError('Usage: folders add <dir>');
+                const problem = checkNewLocal(main, path.resolve(target));
+                if (problem) throw new UserError(problem);
+                const client = await openSession(main);
+                const added = await addPair(main, client, target);
+                notifyChanged();
+                return console.log(
+                    `Added. ${path.resolve(target)} now syncs with Computers → ${added.deviceName} → ${added.name} on Drive.\n` +
+                        'Its files are uploaded on the next sync (if uploading new files is switched on: config uploads new).',
+                );
+            }
+            if (action === 'remove') {
+                if (!target) throw new UserError('Usage: folders remove <dir|id>');
+                acquireLock(STATE_DIR);
+                let local;
+                try {
+                    local = removePair(main, target);
+                } catch (error) {
+                    throw new UserError((error as Error).message);
+                }
+                notifyChanged();
+                return console.log(`Stopped syncing ${local}. Its files stay where they are, here and on Drive.`);
+            }
+            if (action) throw new UserError('Usage: folders | folders add <dir> | folders remove <dir|id>');
+            const pairs = listPairs(main).map((p) => ({ id: p.id, kind: p.kind, label: p.label, local: p.local }));
+            if (json) return console.log(JSON.stringify(pairs));
+            if (!pairs.length) return console.log('No synced folders yet.');
+            for (const p of pairs) {
+                console.log(`${p.local}\n  ↔ ${p.kind === 'myfiles' ? 'My Files' : `Computers → ${os.hostname()} → ${p.label}`}   (id: ${p.id})`);
+            }
+            return;
+        }
         case 'push': {
             const kinds = parseKinds(positional);
             if (!kinds.size) throw new UserError('Say what to upload, e.g.  push new');
-            const db = openState();
-            return runMirror(db, undefined, false, {
+            return runAll(openState(), {
                 kinds,
                 allowMassDelete: args.includes('--allow-many'),
-                confirm: async (plan) => {
-                    printPlan(plan, 'Will');
+                confirm: async (plans) => {
+                    printPlans(plans, 'Will');
                     if (args.includes('--yes')) return true;
-                    const n = plan.items.length;
+                    const n = plans.reduce((sum, p) => sum + p.plan.items.length, 0);
                     const answer = await ask(`\nMake ${n === 1 ? 'this change' : `these ${n} changes`} on Drive? [y/N] `);
                     if (/^y(es)?$/i.test(answer)) return true;
                     console.log('Cancelled; nothing was changed on Drive.');
@@ -249,37 +376,46 @@ async function main(command: string | undefined, args: string[]) {
             });
         }
         case 'restore-deleted': {
-            const db = openState();
-            const folder = getMeta(db, 'root_dir');
-            if (!folder) throw new UserError('No mirror folder yet.');
+            const main = openState();
             acquireLock(STATE_DIR);
-            const plan = await planUploads(db, folder);
-            if (!plan.massDelete) return console.log('No held deletions to undo.');
-            const mirror = await openMirror(db, folder);
-            mirror.restoreMissing(plan.massDelete.items);
-            setMeta(db, 'mass_delete_held', '0');
-            await mirror.run();
+            const client = await openSession(main);
+            let restored = 0;
+            let any = false;
+            for (const pair of listPairs(main)) {
+                const plan = await planUploads(pair.db, pair.local);
+                if (!plan.massDelete) continue;
+                any = true;
+                const mirror = mirrorFor(client, main, pair);
+                mirror.restoreMissing(plan.massDelete.items);
+                setMeta(pair.db, 'mass_delete_held', '0');
+                await mirror.run();
+                restored += mirror.downloaded;
+            }
             notifyChanged();
-            return console.log(`\nRestored: ${mirror.downloaded} files downloaded again.`);
+            return console.log(any ? `\nRestored: ${restored} files downloaded again.` : 'No held deletions to undo.');
         }
         case 'plan': {
-            const db = openState();
-            // Catch up with Drive first, so conflicts are already in Review.
-            await runMirror(db, undefined, false);
-            const plan = await planUploads(db, getMeta(db, 'root_dir')!);
-            if (json) return console.log(JSON.stringify(plan));
-            return printPlan(plan);
+            const main = openState();
+            // Catch up with Drive first (uploading nothing), so conflicts are already in Review.
+            await runAll(main, { kinds: new Set() });
+            const plans = [];
+            for (const pair of listPairs(main)) plans.push({ pair, plan: await planUploads(pair.db, pair.local) });
+            if (json) return console.log(JSON.stringify(plans.map(({ pair, plan }) => ({ folder: pair.id, label: pair.label, ...plan }))));
+            return printPlans(plans, 'Would');
         }
         case 'status': {
             const s = await status(openState());
             if (json) return console.log(JSON.stringify(s));
             console.log(`Logged in:   ${s.username ?? 'no'}`);
-            console.log(`Folder:      ${s.folder ?? 'not chosen yet'}`);
+            for (const f of s.folders) {
+                console.log(`Folder:      ${f.local}  ↔  ${f.kind === 'myfiles' ? 'My Files' : `Computers → ${s.computerName} → ${f.label}`}`);
+            }
+            if (!s.folders.length) console.log('Folders:     none yet');
             console.log(`Running now: ${s.running ? 'yes' : 'no'}`);
             if (s.lastRun) {
                 const r = s.lastRun;
                 console.log(
-                    `Last run:    ${new Date(r.finishedMs).toLocaleString()}, ${r.error ? `failed: ${r.error}` : `${r.downloaded} downloaded, ${r.skipped} skipped, ${r.failures} failed`}`,
+                    `Last run:    ${new Date(r.finishedMs).toLocaleString()}, ${r.error ? `problem: ${r.error}` : `${r.downloaded} downloaded, ${r.skipped} skipped, ${r.failures} failed`}`,
                 );
             }
             if (s.reviewCount) console.log(`To review:   ${s.reviewCount} skipped file(s) (see: review)`);
@@ -290,44 +426,60 @@ async function main(command: string | undefined, args: string[]) {
         }
         case 'activity': {
             const limit = Number(args[args.indexOf('--limit') + 1]) || 100;
-            const rows = openState().prepare('SELECT * FROM activity ORDER BY id DESC LIMIT ?').all(limit) as any[];
-            if (json) return console.log(JSON.stringify(rows.map((r) => ({ timeMs: r.time_ms, kind: r.kind, path: r.path, detail: r.detail }))));
+            const pairs = listPairs(openState());
+            const rows = pairs
+                .flatMap((p) =>
+                    (p.db.prepare('SELECT * FROM activity ORDER BY id DESC LIMIT ?').all(limit) as any[]).map((r) => ({
+                        timeMs: r.time_ms as number,
+                        kind: r.kind as string,
+                        path: r.path as string,
+                        detail: r.detail as string | null,
+                        folder: p.label,
+                    })),
+                )
+                .sort((a, b) => b.timeMs - a.timeMs)
+                .slice(0, limit);
+            if (json) return console.log(JSON.stringify(rows));
             for (const r of rows.reverse()) {
-                console.log(`${new Date(r.time_ms).toLocaleString()}  ${r.kind.padEnd(8)} ${r.path}${r.detail ? `  (${r.detail})` : ''}`);
+                const where = pairs.length > 1 ? `${r.folder} › ` : '';
+                console.log(`${new Date(r.timeMs).toLocaleString()}  ${r.kind.padEnd(8)} ${where}${r.path}${r.detail ? `  (${r.detail})` : ''}`);
             }
             return;
         }
         case 'review': {
-            const db = openState();
-            const query = () => db.prepare('SELECT * FROM review WHERE dismissed = 0 ORDER BY time_ms').all() as any[];
-            let rows = query();
-            const folder = getMeta(db, 'root_dir');
-            if (folder && rows.some((r) => r.drive_mtime_ms === null)) {
+            const main = openState();
+            const pairs = listPairs(main);
+            const query = (db: DatabaseSync) => db.prepare('SELECT * FROM review WHERE dismissed = 0 ORDER BY time_ms').all() as any[];
+            if (pairs.some((p) => query(p.db).some((r) => r.drive_mtime_ms === null))) {
                 // Older items lack the Drive version's details: look them up once.
                 try {
-                    await (await openMirror(db, folder)).fillReviewDetails();
-                    rows = query();
+                    const client = await openSession(main);
+                    for (const p of pairs) await mirrorFor(client, main, p).fillReviewDetails();
                 } catch {
                     // Offline or logged out: show what we have.
                 }
             }
-            const items = rows.map((r) => {
-                let local: { mtimeMs: number; size: number } | null = null;
-                try {
-                    const stat = fs.statSync(path.join(folder ?? '', r.rel_path));
-                    local = { mtimeMs: Math.trunc(stat.mtimeMs), size: stat.size };
-                } catch {
-                    // The local file was moved or deleted since.
-                }
-                const drive = r.drive_mtime_ms === null ? null : { mtimeMs: r.drive_mtime_ms, size: r.drive_size };
-                return { id: r.uid, path: r.rel_path, reason: r.reason, timeMs: r.time_ms, local, drive };
-            });
+            const items = pairs.flatMap((p) =>
+                query(p.db).map((r) => {
+                    let local: { mtimeMs: number; size: number } | null = null;
+                    try {
+                        const stat = fs.statSync(path.join(p.local, r.rel_path));
+                        local = { mtimeMs: Math.trunc(stat.mtimeMs), size: stat.size };
+                    } catch {
+                        // The local file was moved or deleted since.
+                    }
+                    const drive = r.drive_mtime_ms === null ? null : { mtimeMs: r.drive_mtime_ms, size: r.drive_size };
+                    // My Files items keep their plain id (older app versions use it).
+                    const id = p.kind === 'myfiles' ? r.uid : `${p.id}:${r.uid}`;
+                    return { id, path: r.rel_path, folder: p.label, localRoot: p.local, reason: r.reason, timeMs: r.time_ms, local, drive };
+                }),
+            );
             if (json) return console.log(JSON.stringify(items));
             if (!items.length) return console.log('Nothing to review.');
             const describe = (side: { mtimeMs: number; size: number | null } | null) =>
                 side ? `modified ${new Date(side.mtimeMs).toLocaleString()}${side.size !== null ? `, ${side.size} bytes` : ''}` : 'unknown';
             for (const item of items) {
-                console.log(item.path);
+                console.log(`${pairs.length > 1 ? `${item.folder} › ` : ''}${item.path}`);
                 console.log(`  ${item.reason === 'local-edit' ? 'Changed both here and on Drive' : 'Same name as a Drive file, but not created by sync'}`);
                 console.log(`  This computer: ${item.local ? describe(item.local) : 'missing'}`);
                 console.log(`  Drive:         ${describe(item.drive)}`);
@@ -336,16 +488,20 @@ async function main(command: string | undefined, args: string[]) {
             return;
         }
         case 'resolve': {
-            const [uid, action] = positional;
-            if (!uid || (action !== 'keep-local' && action !== 'keep-both')) {
+            const [id, action] = positional;
+            if (!id || (action !== 'keep-local' && action !== 'keep-both')) {
                 throw new UserError('Usage: npm run pdsync -- resolve <id> keep-local|keep-both');
             }
-            const db = openState();
-            const folder = getMeta(db, 'root_dir');
-            if (!folder) throw new UserError('No mirror folder yet.');
+            const main = openState();
+            // "<folder id>:<item id>" for added folders; a plain item id is My Files
+            // (Drive's ids never contain a colon).
+            const colon = id.indexOf(':');
+            const pair = pairById(main, colon > 0 ? id.slice(0, colon) : 'myfiles');
+            const uid = colon > 0 ? id.slice(colon + 1) : id;
             acquireLock(STATE_DIR);
             try {
-                await (await openMirror(db, folder)).resolve(uid, action, { uploadsEdits: enabledKinds(db).has('edits') });
+                const client = await openSession(main);
+                await mirrorFor(client, main, pair).resolve(uid, action, { uploadsEdits: enabledKinds(main).has('edits') });
             } finally {
                 notifyChanged();
             }
@@ -353,36 +509,40 @@ async function main(command: string | undefined, args: string[]) {
         }
         case 'config': {
             const [key, value] = positional;
-            const db = openState();
+            const main = openState();
             if (key === 'uploads' && value) {
                 const kinds = value === 'none' ? new Set<UploadKind>() : parseKinds(positional.slice(1));
-                setMeta(db, 'uploads', [...kinds].join(','));
+                setMeta(main, 'uploads', [...kinds].join(','));
                 notifyChanged();
                 return console.log(kinds.size ? `Automatic runs now upload: ${[...kinds].join(', ')}.` : 'Automatic runs upload nothing (download only).');
             }
             if (key === 'trash' && value) {
                 if (value === 'desktop') {
-                    db.prepare("DELETE FROM meta WHERE key = 'trash'").run();
+                    main.prepare("DELETE FROM meta WHERE key = 'trash'").run();
                 } else {
+                    const resolved = path.resolve(value);
+                    for (const p of listPairs(main)) {
+                        if (overlaps(resolved, p.local)) throw new UserError(`The trash folder must be outside synced folders (${p.local}).`);
+                    }
                     let dir;
                     try {
-                        dir = await prepareTrashFolder(value, getMeta(db, 'root_dir'));
+                        dir = await prepareTrashFolder(value, undefined);
                     } catch (error) {
                         throw new UserError((error as Error).message);
                     }
-                    setMeta(db, 'trash', dir);
+                    setMeta(main, 'trash', dir);
                 }
                 notifyChanged();
-                return console.log(`Files deleted on Drive now go to ${describeTrash(trashTarget(db))}.`);
+                return console.log(`Files deleted on Drive now go to ${describeTrash(trashTarget(main))}.`);
             }
-            if (key !== 'folder' || !value) throw new UserError('Usage: npm run pdsync -- config folder <dir> | config trash desktop|<dir>');
+            if (key !== 'folder' || !value) throw new UserError('Usage: config folder <dir> | config uploads <kinds>|none | config trash desktop|<dir>');
             const folder = path.resolve(value);
-            checkFolder(folder);
-            if (folder === getMeta(db, 'root_dir')) return console.log(`Already mirroring into ${folder}.`);
+            checkMyFilesFolder(main, folder);
+            if (folder === getMeta(main, 'root_dir')) return console.log(`Already mirroring into ${folder}.`);
             acquireLock(STATE_DIR);
             // Start the new mirror from scratch; nothing on disk is touched.
-            db.exec("DELETE FROM nodes; DELETE FROM review; DELETE FROM leftovers; DELETE FROM meta WHERE key IN ('event_id', 'scope', 'account', 'layout');");
-            setMeta(db, 'root_dir', folder);
+            main.exec("DELETE FROM nodes; DELETE FROM review; DELETE FROM leftovers; DELETE FROM meta WHERE key IN ('event_id', 'scope', 'layout', 'mass_delete_held');");
+            setMeta(main, 'root_dir', folder);
             notifyChanged();
             console.log(`From the next run, My Files is mirrored into ${folder}.`);
             return;
@@ -390,8 +550,11 @@ async function main(command: string | undefined, args: string[]) {
         case 'service': {
             const [action, minutes] = positional;
             if (action === 'status') return serviceStatus();
-            if (action === 'install') installService(openState(), minutes ? Number(minutes) : undefined);
-            else if (action === 'uninstall') uninstallService();
+            const main = openState();
+            if (action === 'install') {
+                if (!listPairs(main).length) throw new UserError('Set up a folder to sync first (mirror <folder> or folders add <dir>).');
+                installService(main, minutes ? Number(minutes) : undefined);
+            } else if (action === 'uninstall') uninstallService();
             else throw new UserError('Usage: npm run pdsync -- service install|status|uninstall');
             return notifyChanged();
         }

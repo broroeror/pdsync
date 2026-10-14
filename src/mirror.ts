@@ -22,7 +22,7 @@ import {
 import { kindOf, type Plan, type PlanItem, type UploadKind } from './plan.ts';
 export { kindOf, type UploadKind };
 import { verbose } from './logging.ts';
-import { moveToTrash, trashTarget } from './trash.ts';
+import { moveToTrash, trashTarget, type TrashTarget } from './trash.ts';
 
 export const STATE_DIR = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local/state'), 'pdsync');
 const PART_SUFFIX = '.pdsync-part';
@@ -56,9 +56,14 @@ type Row = {
 
 export type { Row as NodeRow };
 
-export function openState() {
-    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-    const db = new DatabaseSync(path.join(STATE_DIR, 'mirror.db'));
+/**
+ * Sync state. With no argument: the main database, which holds the shared
+ * settings and the My Files pair's records. Each extra folder pair has its
+ * own file (see pairs.ts) with the same tables.
+ */
+export function openState(file = path.join(STATE_DIR, 'mirror.db')) {
+    mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const db = new DatabaseSync(file);
     db.exec(`
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS nodes (
@@ -206,7 +211,23 @@ export class Mirror {
         private client: ProtonDriveClient,
         private db: DatabaseSync,
         private root: string,
+        private options: {
+            /** The Drive folder this pair mirrors; default: My Files. */
+            remoteRootUid?: string;
+            /** Where Drive-deleted copies go; default: this database's setting. */
+            trash?: TrashTarget;
+        } = {},
     ) {}
+
+    private remoteRoot() {
+        return this.options.remoteRootUid
+            ? this.client.getNode(this.options.remoteRootUid)
+            : this.client.getMyFilesRootFolder();
+    }
+
+    private trashTarget() {
+        return this.options.trash ?? trashTarget(this.db);
+    }
 
     async run({ full = false } = {}) {
         const owner = getMeta(this.db, 'root_dir');
@@ -216,7 +237,7 @@ export class Mirror {
         setMeta(this.db, 'root_dir', this.root);
         await fs.mkdir(this.root, { recursive: true });
 
-        const rootNode = await this.client.getMyFilesRootFolder();
+        const rootNode = await this.remoteRoot();
         this.rootUid = rootNode.uid;
         const scope = rootNode.treeEventScopeId;
         const cursor = getMeta(this.db, 'event_id');
@@ -528,7 +549,7 @@ export class Mirror {
      */
     async applyPlan(plan: Plan, kinds: Set<UploadKind>) {
         if (plan.blocked) return;
-        const rootUid = (await this.client.getMyFilesRootFolder()).uid;
+        const rootUid = (await this.remoteRoot()).uid;
         const parentUid = (rel: string) => {
             const parent = path.posix.dirname(rel);
             if (parent === '.') return rootUid;
@@ -740,7 +761,7 @@ export class Mirror {
                 this.clearReview(r.uid);
             }
         };
-        const target = trashTarget(this.db);
+        const target = this.trashTarget();
         const label = row.rel_path + (row.type === 'folder' ? '/' : '');
 
         if (row.type === 'folder' && (await this.onlyUneditedSynced(row.rel_path, affected))) {
@@ -836,7 +857,7 @@ export class Mirror {
 
     /** Retry trashing copies that couldn't be trashed earlier (e.g. drive was unmounted). */
     private async retryTrash() {
-        const target = trashTarget(this.db);
+        const target = this.trashTarget();
         const pending = this.db
             .prepare("SELECT * FROM leftovers WHERE reason = 'removed-on-drive' ORDER BY length(rel_path) DESC")
             .all() as { rel_path: string; type: string; size: number | null; mtime_ms: number | null }[];
