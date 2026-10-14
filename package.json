@@ -1,0 +1,24 @@
+{
+  "name": "proton-drive-sync",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "tsx --import ./src/preload.ts test/crypto-offline.ts && tsx --import ./src/preload.ts test/pubkey-offline.ts && tsx --import ./src/preload.ts test/client-offline.ts",
+    "spike": "tsx --import ./src/preload.ts src/spike.ts",
+    "typecheck": "tsc -p ."
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@protontech/crypto": "^2.2.0",
+    "@protontech/drive-sdk": "^0.22.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
