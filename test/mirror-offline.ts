@@ -6,7 +6,7 @@ import path from 'node:path';
 
 const scratch = await fs.mkdtemp(path.join(process.env.PDSYNC_TEST_TMP || os.tmpdir(), 'pdsync-test-'));
 process.env.XDG_STATE_HOME = path.join(scratch, 'state');
-const { Mirror, openState } = await import('../src/mirror.ts');
+const { Mirror, openState, requestStop, resetStop } = await import('../src/mirror.ts');
 const { NodeWithSameNameExistsValidationError } = await import('@protontech/drive-sdk');
 
 type FakeNode = { uid: string; parentUid?: string; name: string; type: 'file' | 'folder'; rev?: string; content?: string; trashed?: boolean; mediaType?: string };
@@ -693,6 +693,55 @@ removePair(db, docs2);
 assert.deepEqual(listPairs(db).map((p) => p.label), ['My Files', 'Documents']);
 assert.equal(await fs.readFile(path.join(docs2, 'c.txt'), 'utf8'), 'C doc', 'local files stay');
 console.log('✓ removing a folder stops syncing it; its files stay');
+
+// 22. Exclusions: never synced either way, and never mistaken for deletions.
+await fs.mkdir(path.join(root, 'App/node_modules/lib'), { recursive: true });
+await fs.writeFile(path.join(root, 'App/node_modules/lib/index.js'), 'x');
+await fs.writeFile(path.join(root, 'App/main.js'), 'main');
+m = await push(WITH_DELETES);
+const appUid = drive.childNamed('root', 'App')!.uid;
+assert.ok(drive.childNamed(appUid, 'main.js'), 'normal files upload');
+assert.equal(drive.childNamed(appUid, 'node_modules'), undefined, 'node_modules never uploaded');
+// Drive-side clutter is not downloaded either.
+drive.add({ uid: 'NMD', parentUid: appUid, name: '.git', type: 'folder' });
+drive.add({ uid: 'NMD1', parentUid: 'NMD', name: 'HEAD', type: 'file', rev: 'nmd1', content: 'ref' });
+m = await run();
+assert.equal(await exists('App/.git/HEAD'), false);
+// Excluding something already synced removes nothing, here or on Drive.
+db.prepare("INSERT INTO meta (key, value) VALUES ('exclude', '[\"App\"]') ON CONFLICT(key) DO UPDATE SET value = excluded.value").run();
+drive.trashCalls = [];
+m = await push(WITH_DELETES);
+assert.deepEqual(drive.trashCalls, [], 'excluding is not deleting');
+m = new Mirror(drive.client(), db, root);
+await m.run({ full: true });
+assert.equal(await read('App/main.js'), 'main', 'local copy untouched by a full rescan');
+assert.ok(!drive.nodes.get(appUid)!.trashed);
+db.prepare("DELETE FROM meta WHERE key = 'exclude'").run();
+console.log('✓ exclusions: skipped both ways, and excluding never deletes anything');
+
+// 23. Safe stop: no failures counted, unfinished work left for the next run.
+for (let i = 0; i < 5; i++) drive.add({ uid: `ST${i}`, parentUid: 'root', name: `stop-test-${i}.txt`, type: 'file', rev: `st${i}`, content: `s${i}` });
+let seen = 0;
+m = new Mirror(drive.client(), db, root, { onActivity: () => ++seen === 2 && requestStop() });
+await assert.rejects(m.run(), /Stopped by you/);
+assert.equal(m.failures, 0, 'a stop is not a failure');
+const gotBeforeStop = (await fs.readdir(root)).filter((f) => f.startsWith('stop-test-')).length;
+assert.ok(gotBeforeStop >= 2 && gotBeforeStop < 5, `stopped part-way (${gotBeforeStop})`);
+assert.equal((await fs.readdir(root)).filter((f) => f.endsWith('.pdsync-part')).length, 0, 'no half-written files');
+resetStop();
+m = await run();
+assert.equal((await fs.readdir(root)).filter((f) => f.startsWith('stop-test-')).length, 5, 'the next run carries on');
+console.log('✓ a safe stop leaves no half-written files and the next run finishes the job');
+
+// 24. A folder that already exists on Drive (e.g. after an interrupted run) is adopted.
+drive.add({ uid: 'PRE', parentUid: 'root', name: 'Made Before Crash', type: 'folder' });
+drive.events = drive.events.filter((e) => e.nodeUid !== 'PRE'); // as if we never heard about it
+await fs.mkdir(path.join(root, 'Made Before Crash'));
+const mm = new Mirror(drive.client(), db, root);
+await mm.applyPlan(planForKinds(db, await planUploads(db, root), NEW_AND_MOVES), NEW_AND_MOVES);
+assert.equal(mm.failures, 0);
+assert.equal((db.prepare("SELECT uid FROM nodes WHERE rel_path = 'Made Before Crash'").get() as any)?.uid, 'PRE', 'linked to the existing folder');
+console.log('✓ a folder already on Drive is linked, not duplicated or failed');
 
 await fs.rm(scratch, { recursive: true, force: true });
 console.log('\nall mirror checks passed');

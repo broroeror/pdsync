@@ -8,7 +8,8 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { ProtonDriveClient } from '@protontech/drive-sdk';
 import { ApiError } from './api.ts';
 import { acquireLock, lockHolder } from './lock.ts';
-import { finishRun, getMeta, Mirror, openState, setMeta, startRun, STATE_DIR, type UploadKind } from './mirror.ts';
+import { finishRun, getMeta, Mirror, openState, requestStop, setMeta, startRun, STATE_DIR, stopRequested, StopRequested, type UploadKind } from './mirror.ts';
+import { DEFAULT_EXCLUDES, excludeSettings, makeExcluder, saveExcludeSettings } from './exclude.ts';
 import { addPair, checkNewLocal, listPairs, removePair, type Pair } from './pairs.ts';
 import { planForKinds, planUploads, type Plan } from './plan.ts';
 import { ask } from './prompt.ts';
@@ -30,6 +31,13 @@ const USAGE = `Usage: npm run pdsync -- <command>
                       Computers on Drive)
   folders remove <dir|id>
                       Stop syncing a folder (its files stay, here and on Drive)
+  folders measure <dir>
+                      How many files/bytes a folder has, before and after the
+                      default exclusions (node_modules, .git, caches, ...)
+  folders excludes <dir|id> [--defaults on|off] [--set <pattern>...]
+                      Show or change what a folder never syncs
+  stop                Stop a sync in progress safely (finishes or cancels the
+                      current step; the next sync carries on)
   plan                Dry run of uploading: sync with Drive, then list what
                       would change on Drive. Changes nothing on Drive.
   push <kinds> [--yes]
@@ -107,8 +115,48 @@ async function openSession(main: DatabaseSync) {
     return client;
 }
 
-function mirrorFor(client: ProtonDriveClient, main: DatabaseSync, pair: Pair) {
-    return new Mirror(client, pair.db, pair.local, { remoteRootUid: pair.remoteUid, trash: trashTarget(main) });
+function mirrorFor(client: ProtonDriveClient, main: DatabaseSync, pair: Pair, onActivity?: (kind: string, rel: string) => void) {
+    return new Mirror(client, pair.db, pair.local, { remoteRootUid: pair.remoteUid, trash: trashTarget(main), onActivity });
+}
+
+/** Folder size before and after exclusions, for the "add folder" check. */
+async function measureFolder(dir: string, patterns: string[]) {
+    const excluded = makeExcluder(patterns);
+    const result = { files: 0, bytes: 0, includedFiles: 0, includedBytes: 0 };
+    const walk = async (rel: string, skipped: boolean) => {
+        let entries;
+        try {
+            entries = await fs.promises.readdir(path.join(dir, rel), { withFileTypes: true });
+        } catch {
+            return;
+        }
+        for (const d of entries) {
+            const childRel = rel ? `${rel}/${d.name}` : d.name;
+            const isSkipped = skipped || excluded(childRel);
+            if (d.isDirectory()) await walk(childRel, isSkipped);
+            else if (d.isFile()) {
+                const size = (await fs.promises.stat(path.join(dir, childRel)).catch(() => ({ size: 0 }))).size;
+                result.files++;
+                result.bytes += size;
+                if (!isSkipped) {
+                    result.includedFiles++;
+                    result.includedBytes += size;
+                }
+            }
+        }
+    };
+    await walk('', false);
+    return result;
+}
+
+const humanSize = (n: number) =>
+    n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : n < 1073741824 ? `${(n / 1048576).toFixed(1)} MB` : `${(n / 1073741824).toFixed(2)} GB`;
+
+function findPair(main: DatabaseSync, idOrDir: string) {
+    const local = path.resolve(idOrDir);
+    const pair = listPairs(main).find((p) => p.id === idOrDir || p.local === local);
+    if (!pair) throw new UserError(`No synced folder ${idOrDir}`);
+    return pair;
 }
 
 function pairById(main: DatabaseSync, id: string) {
@@ -137,12 +185,46 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
     acquireLock(STATE_DIR);
     const runId = startRun(main);
     notifyChanged();
-    const totals = { downloaded: 0, uploaded: 0, trashedOnDrive: 0, trashed: 0, skipped: 0, failures: 0 };
+
+    // Stop button / logout / Ctrl+C: stop safely at the next step. A second
+    // request stops at once (the next run cleans up).
+    const onSignal = () => {
+        if (stopRequested()) process.exit(130);
+        console.log('\nStopping safely after the current step…');
+        requestStop();
+    };
+    process.on('SIGTERM', onSignal);
+    process.on('SIGINT', onSignal);
+
+    const totals = { downloaded: 0, uploaded: 0, created: 0, trashedOnDrive: 0, trashed: 0, skipped: 0, failures: 0 };
     const errors: string[] = [];
     const mirrors = new Map<Pair, Mirror>();
+
+    // Live progress for the app, written at most about once a second.
+    const progress = { startedMs: Date.now(), lastMs: 0, lastItem: '', folder: '' };
+    let lastWrite = 0;
+    let pending: NodeJS.Timeout | undefined;
+    const writeProgress = () => {
+        lastWrite = Date.now();
+        const live = { downloaded: 0, uploaded: 0, created: 0, trashedOnDrive: 0, trashed: 0, failures: 0 };
+        for (const m of mirrors.values()) for (const k of Object.keys(live) as (keyof typeof live)[]) live[k] += m[k];
+        setMeta(main, 'progress', JSON.stringify({ ...progress, ...live }));
+        notifyChanged();
+    };
+    const onActivity = (folder: string) => (_kind: string, rel: string) => {
+        Object.assign(progress, { lastMs: Date.now(), lastItem: rel, folder });
+        const wait = 1000 - (Date.now() - lastWrite);
+        if (wait <= 0) writeProgress();
+        else pending ??= setTimeout(() => ((pending = undefined), writeProgress()), wait);
+    };
+    const endProgress = () => {
+        clearTimeout(pending);
+        main.prepare("DELETE FROM meta WHERE key = 'progress'").run();
+    };
     const add = (m: Mirror) => {
         totals.downloaded += m.downloaded;
         totals.uploaded += m.uploaded;
+        totals.created += m.created;
         totals.trashedOnDrive += m.trashedOnDrive;
         totals.trashed += m.trashed;
         totals.skipped += m.skipped;
@@ -155,7 +237,7 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
         const plans: { pair: Pair; plan: Plan }[] = [];
 
         for (const pair of pairs) {
-            const mirror = mirrorFor(client, main, pair);
+            const mirror = mirrorFor(client, main, pair, onActivity(pair.label));
             mirrors.set(pair, mirror);
             try {
                 await mirror.run({ full: opts.full });
@@ -176,7 +258,7 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
                 if (plan.blocked) console.log(`${pair.label}: ${plan.blocked}`);
                 plans.push({ pair, plan });
             } catch (error) {
-                if (error instanceof AuthError || (error instanceof ApiError && error.status === 401)) throw error;
+                if (error instanceof StopRequested || error instanceof AuthError || (error instanceof ApiError && error.status === 401)) throw error;
                 totals.failures++;
                 errors.push(`${pair.label}: ${error instanceof Error ? error.message : String(error)}`);
                 console.error(`✗ ${pair.label}: ${error instanceof Error ? error.message : String(error)}`);
@@ -191,7 +273,14 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
             for (const { pair, plan } of work) await mirrors.get(pair)!.applyPlan(plan, kinds);
         }
     } catch (error) {
+        endProgress();
         for (const m of mirrors.values()) add(m);
+        if (error instanceof StopRequested) {
+            finishRun(main, runId, { ...totals, errorKind: 'stopped', error: 'Stopped by you' });
+            notifyChanged();
+            console.log(`\nStopped. Done before stopping: ${totals.downloaded} downloaded, ${totals.uploaded} uploaded, ${totals.created} folders created. The next sync carries on from here.`);
+            return;
+        }
         const auth = error instanceof AuthError || (error instanceof ApiError && error.status === 401);
         finishRun(main, runId, {
             ...totals,
@@ -202,12 +291,14 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
         notifyChanged();
         throw error;
     }
+    endProgress();
     for (const m of mirrors.values()) add(m);
     finishRun(main, runId, { ...totals, error: errors.length ? errors.join('; ') : undefined, errorKind: errors.length ? 'other' : undefined });
     notifyChanged();
 
     const parts = [`${totals.downloaded} downloaded`];
     if (totals.uploaded) parts.push(`${totals.uploaded} uploaded`);
+    if (totals.created) parts.push(`${totals.created} folders created on Drive`);
     if (totals.trashedOnDrive) parts.push(`${totals.trashedOnDrive} moved to Drive's trash`);
     if (totals.trashed) parts.push(`${totals.trashed} moved to trash (deleted on Drive)`);
     if (totals.skipped) parts.push(`${totals.skipped} skipped (see: review)`);
@@ -265,9 +356,11 @@ async function status(main: DatabaseSync) {
             local: p.local,
             firstSyncDone: !!getMeta(p.db, 'event_id'),
             reviewCount: reviewCount(p.db),
+            excludes: excludeSettings(p.db),
         })),
         computerName: os.hostname(),
         running: lockHolder(STATE_DIR) !== null,
+        progress: lockHolder(STATE_DIR) !== null ? JSON.parse(getMeta(main, 'progress') ?? 'null') : null,
         lastRun: lastRun
             ? {
                   finishedMs: lastRun.finished_ms,
@@ -325,10 +418,49 @@ async function main(command: string | undefined, args: string[]) {
         case 'folders': {
             const main = openState();
             const [action, target] = positional;
+            if (action === 'measure') {
+                if (!target) throw new UserError('Usage: folders measure <dir>');
+                const m = await measureFolder(path.resolve(target), DEFAULT_EXCLUDES);
+                if (json) return console.log(JSON.stringify(m));
+                return console.log(
+                    `${m.files.toLocaleString()} files (${humanSize(m.bytes)}); after skipping node_modules, .git, caches and similar: ` +
+                        `${m.includedFiles.toLocaleString()} files (${humanSize(m.includedBytes)}).`,
+                );
+            }
+            if (action === 'excludes') {
+                if (!target) throw new UserError('Usage: folders excludes <dir|id> [--defaults on|off] [--set <pattern>...]');
+                const pair = findPair(main, target);
+                const settings = excludeSettings(pair.db);
+                const defaultsArg = args[args.indexOf('--defaults') + 1];
+                const setAt = args.indexOf('--set');
+                if (args.includes('--defaults') || setAt >= 0) {
+                    acquireLock(STATE_DIR);
+                    saveExcludeSettings(pair.db, {
+                        defaults: args.includes('--defaults') ? defaultsArg !== 'off' : settings.defaults,
+                        custom: setAt >= 0 ? args.slice(setAt + 1).filter((a) => !a.startsWith('--')) : settings.custom,
+                    });
+                    notifyChanged();
+                }
+                const now = excludeSettings(pair.db);
+                if (json) return console.log(JSON.stringify(now));
+                console.log(`${pair.local} never syncs:`);
+                console.log(`  defaults (${now.defaults ? 'on' : 'off'}): ${DEFAULT_EXCLUDES.join(', ')}`);
+                console.log(`  yours: ${now.custom.length ? now.custom.join(', ') : 'none'}`);
+                return;
+            }
             if (action === 'add') {
                 if (!target) throw new UserError('Usage: folders add <dir>');
                 const problem = checkNewLocal(main, path.resolve(target));
                 if (problem) throw new UserError(problem);
+                if (!args.includes('--yes')) {
+                    const m = await measureFolder(path.resolve(target), DEFAULT_EXCLUDES);
+                    console.log(
+                        `${path.resolve(target)} has ${m.files.toLocaleString()} files (${humanSize(m.bytes)}). ` +
+                            `After skipping node_modules, .git, caches and similar: ${m.includedFiles.toLocaleString()} files (${humanSize(m.includedBytes)}).`,
+                    );
+                    const answer = await ask('Sync this folder? [y/N] ');
+                    if (!/^y(es)?$/i.test(answer)) return console.log('Not added.');
+                }
                 const client = await openSession(main);
                 const added = await addPair(main, client, target);
                 notifyChanged();
@@ -357,6 +489,17 @@ async function main(command: string | undefined, args: string[]) {
                 console.log(`${p.local}\n  ↔ ${p.kind === 'myfiles' ? 'My Files' : `Computers → ${os.hostname()} → ${p.label}`}   (id: ${p.id})`);
             }
             return;
+        }
+        case 'stop': {
+            const pid = lockHolder(STATE_DIR);
+            if (!pid) return console.log('No sync is running.');
+            process.kill(pid, 'SIGTERM');
+            console.log('Asked the sync to stop; it finishes or cancels the current step first…');
+            for (let waited = 0; waited < 120; waited++) {
+                await new Promise((r) => setTimeout(r, 500));
+                if (lockHolder(STATE_DIR) === null) return console.log('Stopped.');
+            }
+            throw new UserError('It is taking a while to stop (a large step?). It will stop on its own; you can check with: status');
         }
         case 'push': {
             const kinds = parseKinds(positional);

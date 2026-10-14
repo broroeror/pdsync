@@ -22,7 +22,39 @@ import {
 import { kindOf, type Plan, type PlanItem, type UploadKind } from './plan.ts';
 export { kindOf, type UploadKind };
 import { verbose } from './logging.ts';
+import { excluderFor } from './exclude.ts';
 import { moveToTrash, trashTarget, type TrashTarget } from './trash.ts';
+
+/** Thrown at the next safe point after the user asks to stop. */
+export class StopRequested extends Error {
+    constructor() {
+        super('Stopped by you');
+    }
+}
+
+// One stop switch per process: set by `requestStop()` (e.g. on SIGTERM).
+// Transfers in flight are cancelled through the signal; everything else
+// stops at the next checkpoint, between steps.
+const stopper = { requested: false, controller: new AbortController() };
+
+export function requestStop() {
+    stopper.requested = true;
+    stopper.controller.abort(new StopRequested());
+}
+
+/** Clear a previous stop (a long-lived process, or tests). */
+export function resetStop() {
+    stopper.requested = false;
+    stopper.controller = new AbortController();
+}
+
+export function stopRequested() {
+    return stopper.requested;
+}
+
+function checkStop() {
+    if (stopper.requested) throw new StopRequested();
+}
 
 export const STATE_DIR = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local/state'), 'pdsync');
 const PART_SUFFIX = '.pdsync-part';
@@ -199,6 +231,7 @@ export class Mirror {
     private needsRescan = false;
     downloaded = 0;
     uploaded = 0;
+    created = 0;
     trashed = 0;
     trashedOnDrive = 0;
     skipped = 0;
@@ -216,8 +249,18 @@ export class Mirror {
             remoteRootUid?: string;
             /** Where Drive-deleted copies go; default: this database's setting. */
             trash?: TrashTarget;
+            /** Called after each recorded action (for live progress). */
+            onActivity?: (kind: string, rel: string) => void;
         } = {},
     ) {}
+
+    private excluder?: (rel: string) => boolean;
+
+    /** Paths never synced in either direction (see exclude.ts). */
+    private excluded(rel: string) {
+        this.excluder ??= excluderFor(this.db);
+        return this.excluder(rel);
+    }
 
     private remoteRoot() {
         return this.options.remoteRootUid
@@ -258,7 +301,8 @@ export class Mirror {
             return;
         }
 
-        for await (const event of this.client.iterateEvents(scope, cursor)) {
+        for await (const event of this.client.iterateEvents(scope, cursor, stopper.controller.signal)) {
+            checkStop();
             switch (event.type) {
                 case DriveEventType.NodeCreated:
                 case DriveEventType.NodeUpdated:
@@ -298,6 +342,7 @@ export class Mirror {
             const [folderUid, folderRel] = queue.shift()!;
             try {
                 for await (const child of this.client.iterateFolderChildren(folderUid)) {
+                    checkStop();
                     if (child.trashTime) continue;
                     seen.add(child.uid);
                     await this.syncNode(child, folderRel);
@@ -313,8 +358,11 @@ export class Mirror {
         // Anything we knew about that the walk didn't see is gone from Drive.
         // Skip this if the walk was incomplete, or we'd misreport removals.
         if (this.failures) return;
-        const rows = this.db.prepare('SELECT uid FROM nodes').all() as { uid: string }[];
-        for (const { uid } of rows) if (!seen.has(uid)) await this.removedRemotely(uid);
+        // (Excluded paths are skipped by the walk; never mistake them for deletions.)
+        const unseen = this.db.prepare('SELECT uid, rel_path FROM nodes').all() as { uid: string; rel_path: string }[];
+        for (const { uid, rel_path } of unseen) {
+            if (!seen.has(uid) && !this.excluded(rel_path)) await this.removedRemotely(uid);
+        }
     }
 
     private async syncByUid(uid: string) {
@@ -348,6 +396,7 @@ export class Mirror {
         const name = this.safeName(node);
         if (name === null) return;
         const rel = parentRel ? `${parentRel}/${name}` : name;
+        if (this.excluded(rel)) return;
         const row = this.getRow(node.uid);
 
         if (node.type === NodeType.Folder) {
@@ -448,7 +497,7 @@ export class Mirror {
         let stream: WritableStream | undefined;
         try {
             await fs.mkdir(path.dirname(target), { recursive: true });
-            const downloader = await this.client.getFileRevisionDownloader(revisionUid);
+            const downloader = await this.client.getFileRevisionDownloader(revisionUid, stopper.controller.signal);
             const out = createWriteStream(part);
             stream = Writable.toWeb(out);
             const controller = downloader.downloadToStream(stream);
@@ -564,6 +613,7 @@ export class Mirror {
         while (pending.length) {
             const waiting: PlanItem[] = [];
             for (const item of pending) {
+                checkStop();
                 const parent = parentUid(destination(item));
                 if (!parent && item.action !== 'update' && item.action !== 'trash') {
                     waiting.push(item);
@@ -605,11 +655,11 @@ export class Mirror {
                 });
             }
             const before = await fs.stat(target);
-            const uploader = await this.client.getFileRevisionUploader(uid, {
-                mediaType: mediaTypeOf(rel),
-                expectedSize: before.size,
-                modificationTime: before.mtime,
-            });
+            const uploader = await this.client.getFileRevisionUploader(
+                uid,
+                { mediaType: mediaTypeOf(rel), expectedSize: before.size, modificationTime: before.mtime },
+                stopper.controller.signal,
+            );
             const controller = await uploader.uploadFromStream(Readable.toWeb(createReadStream(target)) as ReadableStream, []);
             const { nodeRevisionUid } = await controller.completion();
             this.upsert({
@@ -695,10 +745,24 @@ export class Mirror {
     private async createFolder(rel: string, parent: string | undefined) {
         if (!parent) return this.fail(rel, 'creating the folder', new Error('its parent folder is not on Drive'));
         try {
-            const node = await this.client.createFolder(parent, path.posix.basename(rel));
+            let uid: string;
+            let detail = 'folder created on Drive';
+            try {
+                uid = (await this.client.createFolder(parent, path.posix.basename(rel))).uid;
+            } catch (error) {
+                // Drive already has a folder by that name (e.g. a run stopped
+                // right after creating it, or a re-added folder): use it. Its
+                // contents are picked up by a full rescan on the next run.
+                const existing = error instanceof NodeWithSameNameExistsValidationError ? error.existingNodeUid : undefined;
+                if (!existing || (await this.client.getNode(existing)).type !== NodeType.Folder) throw error;
+                uid = existing;
+                detail = 'already on Drive; linked to it';
+                setMeta(this.db, 'layout', '0');
+            }
             const { ino } = await fs.stat(this.abs(rel));
-            this.upsert({ uid: node.uid, type: 'folder', rel_path: rel, revision_uid: null, local_size: null, local_mtime_ms: null, local_ino: ino });
-            this.record('created', rel + '/', 'folder created on Drive');
+            this.upsert({ uid, type: 'folder', rel_path: rel, revision_uid: null, local_size: null, local_mtime_ms: null, local_ino: ino });
+            this.created++;
+            this.record('created', rel + '/', detail);
         } catch (error) {
             this.fail(rel + '/', 'creating the folder', friendlyWriteError(error));
         }
@@ -709,11 +773,12 @@ export class Mirror {
         const target = this.abs(rel);
         try {
             const before = await fs.stat(target);
-            const uploader = await this.client.getFileUploader(parent, path.posix.basename(rel), {
-                mediaType: mediaTypeOf(rel),
-                expectedSize: before.size,
-                modificationTime: before.mtime,
-            });
+            const uploader = await this.client.getFileUploader(
+                parent,
+                path.posix.basename(rel),
+                { mediaType: mediaTypeOf(rel), expectedSize: before.size, modificationTime: before.mtime },
+                stopper.controller.signal,
+            );
             const controller = await uploader.uploadFromStream(Readable.toWeb(createReadStream(target)) as ReadableStream, []);
             const { nodeUid, nodeRevisionUid } = await controller.completion();
             // Record what was uploaded (the 'before' stat): if the file changed
@@ -1091,6 +1156,7 @@ export class Mirror {
 
     private record(kind: string, rel: string, detail?: string) {
         addActivity(this.db, kind, rel, detail);
+        this.options.onActivity?.(kind, rel);
         const symbol =
             { download: '↓', upload: '↑', created: '+', move: '→', moved: '→', trashed: '✕', removed: '✕', skipped: '!', failed: '✗', warning: '!', resolved: '✓' }[kind] ??
             '·';
@@ -1106,6 +1172,8 @@ export class Mirror {
     }
 
     private fail(rel: string, action: string, error: unknown) {
+        // A stop (or a transfer cancelled by it) unwinds the whole run.
+        if (error instanceof StopRequested || stopper.requested) throw new StopRequested();
         this.failures++;
         this.record('failed', rel, `${action} failed: ${error instanceof Error ? error.message : String(error)}`);
         if (verbose && error instanceof Error) console.error(error.stack);

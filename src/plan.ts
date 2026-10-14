@@ -5,6 +5,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
+import { excluderFor } from './exclude.ts';
 import type { NodeRow } from './mirror.ts';
 
 export type PlanItem =
@@ -57,7 +58,7 @@ export function isIgnored(name: string) {
     return IGNORED.some((re) => re.test(name));
 }
 
-async function scanLocal(root: string) {
+async function scanLocal(root: string, excluded: (rel: string) => boolean = () => false) {
     const entries = new Map<string, LocalEntry>();
     const walk = async (dirRel: string) => {
         for (const dirent of await fs.readdir(path.join(root, dirRel), { withFileTypes: true })) {
@@ -65,6 +66,7 @@ async function scanLocal(root: string) {
             // Symlinks and special files are not synced (and never followed).
             if (!dirent.isFile() && !dirent.isDirectory()) continue;
             const rel = dirRel ? `${dirRel}/${dirent.name}` : dirent.name;
+            if (excluded(rel)) continue;
             const stat = await fs.lstat(path.join(root, rel));
             const type = dirent.isDirectory() ? 'folder' : 'file';
             entries.set(rel, { rel, type, size: stat.size, mtimeMs: Math.trunc(stat.mtimeMs), ino: stat.ino });
@@ -90,7 +92,8 @@ export async function planUploads(db: DatabaseSync, root: string, { allowMassDel
     if (!rootStat?.isDirectory()) {
         return { ...plan, blocked: `The folder ${root} is missing (unmounted drive?), so nothing will be changed on Drive.` };
     }
-    const local = await scanLocal(root);
+    const excluded = excluderFor(db);
+    const local = await scanLocal(root, excluded);
     if (local.size === 0 && rows.length > 0) {
         return { ...plan, blocked: `The folder ${root} is empty, so nothing will be changed on Drive (it may not be mounted).` };
     }
@@ -101,7 +104,9 @@ export async function planUploads(db: DatabaseSync, root: string, { allowMassDel
     const backfillIno = db.prepare('UPDATE nodes SET local_ino = ? WHERE uid = ?');
 
     const matches = (row: NodeRow, e: LocalEntry) => e.size === row.local_size && e.mtimeMs === row.local_mtime_ms;
-    const done = new Set<string>(); // row uids accounted for
+    // Excluded items that were synced before the exclusion: left alone (never
+    // treated as deleted, which would trash them on Drive).
+    const done = new Set<string>(rows.filter((r) => excluded(r.rel_path)).map((r) => r.uid)); // row uids accounted for
     const claimed = new Set<string>(links.map((l) => l.rel_path)); // local paths accounted for
 
     /** A row whose local entry is at `rel`: unchanged, edited, or held. */
