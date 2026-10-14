@@ -162,11 +162,40 @@ async function main(command: string | undefined, args: string[]) {
             return;
         }
         case 'review': {
-            const rows = openState().prepare('SELECT * FROM review WHERE dismissed = 0 ORDER BY time_ms').all() as any[];
-            if (json) return console.log(JSON.stringify(rows.map((r) => ({ id: r.uid, path: r.rel_path, reason: r.reason, timeMs: r.time_ms }))));
-            if (!rows.length) return console.log('Nothing to review.');
-            for (const r of rows) {
-                console.log(`${r.rel_path}\n  ${r.reason === 'local-edit' ? 'Edited locally and changed on Drive' : 'A local file with this name already existed'}\n  id: ${r.uid}`);
+            const db = openState();
+            const query = () => db.prepare('SELECT * FROM review WHERE dismissed = 0 ORDER BY time_ms').all() as any[];
+            let rows = query();
+            const folder = getMeta(db, 'root_dir');
+            if (folder && rows.some((r) => r.drive_mtime_ms === null)) {
+                // Older items lack the Drive version's details: look them up once.
+                try {
+                    await (await openMirror(db, folder)).fillReviewDetails();
+                    rows = query();
+                } catch {
+                    // Offline or logged out: show what we have.
+                }
+            }
+            const items = rows.map((r) => {
+                let local: { mtimeMs: number; size: number } | null = null;
+                try {
+                    const stat = fs.statSync(path.join(folder ?? '', r.rel_path));
+                    local = { mtimeMs: Math.trunc(stat.mtimeMs), size: stat.size };
+                } catch {
+                    // The local file was moved or deleted since.
+                }
+                const drive = r.drive_mtime_ms === null ? null : { mtimeMs: r.drive_mtime_ms, size: r.drive_size };
+                return { id: r.uid, path: r.rel_path, reason: r.reason, timeMs: r.time_ms, local, drive };
+            });
+            if (json) return console.log(JSON.stringify(items));
+            if (!items.length) return console.log('Nothing to review.');
+            const describe = (side: { mtimeMs: number; size: number | null } | null) =>
+                side ? `modified ${new Date(side.mtimeMs).toLocaleString()}${side.size !== null ? `, ${side.size} bytes` : ''}` : 'unknown';
+            for (const item of items) {
+                console.log(item.path);
+                console.log(`  ${item.reason === 'local-edit' ? 'Changed both here and on Drive' : 'Same name as a Drive file, but not created by sync'}`);
+                console.log(`  This computer: ${item.local ? describe(item.local) : 'missing'}`);
+                console.log(`  Drive:         ${describe(item.drive)}`);
+                console.log(`  id: ${item.id}`);
             }
             return;
         }

@@ -19,45 +19,81 @@ ColumnLayout {
         Layout.fillWidth: true
     }
 
-    Frame {
+    Label {
+        visible: reviewList.count === 0
+        text: "Nothing needs a decision."
+        opacity: 0.6
+        horizontalAlignment: Text.AlignHCenter
+        Layout.fillWidth: true
+        Layout.topMargin: 40
+    }
+
+    ListView {
+        id: reviewList
+        clip: true
+        spacing: 10
+        model: backend.reviewItems
         Layout.fillWidth: true
         Layout.fillHeight: true
-        padding: 0
+        ScrollBar.vertical: ScrollBar {}
 
-        Label {
-            anchors.centerIn: parent
-            visible: reviewList.count === 0
-            text: "Nothing needs a decision."
-            opacity: 0.6
-        }
+        delegate: Frame {
+            id: card
+            required property var modelData
+            width: ListView.view.width - 2
 
-        ListView {
-            id: reviewList
-            anchors.fill: parent
-            clip: true
-            spacing: 2
-            model: backend.reviewItems
-            ScrollBar.vertical: ScrollBar {}
-            delegate: ItemDelegate {
-                width: ListView.view.width
-                hoverEnabled: false
-                contentItem: RowLayout {
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 8
+
+                Label {
+                    text: card.modelData.path
+                    font.bold: true
+                    elide: Text.ElideMiddle
+                    Layout.fillWidth: true
+                }
+                Label {
+                    text: card.modelData.explanation
+                    wrapMode: Text.WordWrap
+                    opacity: 0.8
+                    Layout.fillWidth: true
+                }
+
+                RowLayout {
                     spacing: 10
-                    ColumnLayout {
-                        spacing: 2
-                        Layout.fillWidth: true
-                        Label { text: modelData.path; font.bold: true; elide: Text.ElideMiddle; Layout.fillWidth: true }
-                        Label { text: modelData.explanation; wrapMode: Text.WordWrap; opacity: 0.75; Layout.fillWidth: true }
+                    Layout.fillWidth: true
+                    VersionBox {
+                        title: "On this computer"
+                        info: card.modelData.local
+                        missingText: card.modelData.localMissing ? "Not in the folder any more" : ""
+                        newer: card.modelData.newer === "local"
+                        actionText: card.modelData.localMissing ? "" : "Open"
+                        onAction: backend.openLocalFile(card.modelData.path)
                     }
+                    VersionBox {
+                        title: "On Drive"
+                        info: card.modelData.drive
+                        missingText: card.modelData.drive.known ? "" : "Details not available offline"
+                        newer: card.modelData.newer === "drive"
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Item { Layout.fillWidth: true }
                     Button {
                         text: "Keep mine"
                         enabled: !backend.busyAction
-                        onClicked: backend.resolve(modelData.id, "keep-local")
+                        ToolTip.visible: hovered
+                        ToolTip.text: "Leave your file as it is"
+                        onClicked: backend.resolve(card.modelData.id, "keep-local")
                     }
                     Button {
                         text: "Keep both"
                         enabled: !backend.busyAction
-                        onClicked: backend.resolve(modelData.id, "keep-both")
+                        ToolTip.visible: hovered
+                        ToolTip.text: "Rename your file aside and download the Drive version"
+                        onClicked: backend.resolve(card.modelData.id, "keep-both")
                     }
                 }
             }

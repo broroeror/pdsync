@@ -20,6 +20,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
+from PySide6.QtCore import QDateTime, QLocale
 from PySide6.QtGui import QDesktopServices
 
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "pdsync"
@@ -34,6 +35,20 @@ def engine_command() -> list[str]:
         return [env]
     dev = Path(__file__).resolve().parents[2] / "bin" / "pdsync"
     return [str(dev)] if dev.is_file() else ["pdsync"]
+
+
+def describe_version(side: dict | None) -> dict:
+    """Date/time and size of one side of a review item, formatted for display."""
+    if not side:
+        return {"known": False, "when": "", "size": ""}
+    locale = QLocale.system()
+    when = locale.toString(QDateTime.fromMSecsSinceEpoch(int(side["mtimeMs"])), QLocale.FormatType.ShortFormat)
+    size = side.get("size")
+    return {
+        "known": True,
+        "when": when,
+        "size": locale.formattedDataSize(size) if size is not None else "",
+    }
 
 
 def relative_time(ms: int | None, future: bool = False) -> str:
@@ -264,18 +279,40 @@ class Backend(QObject):
 
     @Property("QVariantList", notify=changed)
     def reviewItems(self) -> list:
-        return [
-            {
-                "id": r["id"],
-                "path": r["path"],
-                "explanation": (
-                    "You edited this file here, and it also changed on Drive."
-                    if r["reason"] == "local-edit"
-                    else "A file with this name was already in the folder before sync created it."
-                ),
-            }
-            for r in self._review
-        ]
+        items = []
+        for r in self._review:
+            local, drive = r.get("local"), r.get("drive")
+            newer = ""
+            if local and drive and abs(local["mtimeMs"] - drive["mtimeMs"]) > 1000:
+                newer = "local" if local["mtimeMs"] > drive["mtimeMs"] else "drive"
+            local_info, drive_info = describe_version(local), describe_version(drive)
+            # Rounded sizes can match for different files (1,528 vs 1,523 bytes
+            # are both "1.49 KiB"): show exact bytes when that hides a difference.
+            if (
+                local and drive and local.get("size") is not None and drive.get("size") is not None
+                and local["size"] != drive["size"] and local_info["size"] == drive_info["size"]
+            ):
+                locale = QLocale.system()
+                local_info["size"] = f"{locale.toString(local['size'])} bytes"
+                drive_info["size"] = f"{locale.toString(drive['size'])} bytes"
+            items.append(
+                {
+                    "id": r["id"],
+                    "path": r["path"],
+                    "explanation": (
+                        "This file was changed on this computer, and a different version was saved to Drive. "
+                        "Sync didn't replace your copy."
+                        if r["reason"] == "local-edit"
+                        else "Your folder already had a file with this name, and Drive has a different file "
+                        "with the same name. Sync didn't replace yours."
+                    ),
+                    "local": local_info,
+                    "localMissing": local is None,
+                    "drive": drive_info,
+                    "newer": newer,
+                }
+            )
+        return items
 
     @Property(str, notify=changed)
     def busyAction(self) -> str:
@@ -339,6 +376,12 @@ class Backend(QObject):
     @Slot(str, str)
     def resolve(self, item_id: str, action: str):
         self._action("resolve", ["resolve", item_id, action])
+
+    @Slot(str)
+    def openLocalFile(self, rel_path: str):
+        """Open the local copy of a review item in its default app."""
+        if self.folder:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(self.folder) / rel_path)))
 
     @Slot()
     def openFolder(self):

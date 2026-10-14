@@ -73,6 +73,10 @@ export function openState() {
             dismissed INTEGER NOT NULL DEFAULT 0
         );
     `);
+    // Added later: the Drive version's details, shown next to the local file.
+    const reviewColumns = new Set((db.prepare('PRAGMA table_info(review)').all() as { name: string }[]).map((c) => c.name));
+    if (!reviewColumns.has('drive_mtime_ms')) db.exec('ALTER TABLE review ADD COLUMN drive_mtime_ms INTEGER');
+    if (!reviewColumns.has('drive_size')) db.exec('ALTER TABLE review ADD COLUMN drive_size INTEGER');
     return db;
 }
 
@@ -265,7 +269,10 @@ export class Mirror {
 
         const existing = await statOrNull(this.abs(rel));
         if (existing && !(current && this.matches(current, existing))) {
-            return this.needsReview(node.uid, rel, current ? 'local-edit' : 'local-exists', revision.uid);
+            return this.needsReview(node.uid, rel, current ? 'local-edit' : 'local-exists', revision.uid, {
+                mtimeMs: (revision.claimedModificationTime ?? node.modificationTime).getTime(),
+                size: revision.claimedSize ?? null,
+            });
         }
         await this.download(node, rel, revision.uid, revision.claimedModificationTime ?? node.modificationTime);
     }
@@ -419,7 +426,13 @@ export class Mirror {
             .run(r.uid, r.type, r.rel_path, r.revision_uid, r.local_size, r.local_mtime_ms);
     }
 
-    private needsReview(uid: string, rel: string, reason: 'local-edit' | 'local-exists', revisionUid: string) {
+    private needsReview(
+        uid: string,
+        rel: string,
+        reason: 'local-edit' | 'local-exists',
+        revisionUid: string,
+        drive: { mtimeMs: number; size: number | null },
+    ) {
         const known = this.db.prepare('SELECT revision_uid, dismissed FROM review WHERE uid = ?').get(uid) as
             | { revision_uid: string; dismissed: number }
             | undefined;
@@ -427,11 +440,13 @@ export class Mirror {
         if (known?.dismissed && known.revision_uid === revisionUid) return;
         this.db
             .prepare(
-                `INSERT INTO review (uid, rel_path, reason, revision_uid, time_ms, dismissed) VALUES (?, ?, ?, ?, ?, 0)
+                `INSERT INTO review (uid, rel_path, reason, revision_uid, time_ms, dismissed, drive_mtime_ms, drive_size)
+                 VALUES (?, ?, ?, ?, ?, 0, ?, ?)
                  ON CONFLICT(uid) DO UPDATE SET rel_path = excluded.rel_path, reason = excluded.reason,
-                     revision_uid = excluded.revision_uid, time_ms = excluded.time_ms, dismissed = 0`,
+                     revision_uid = excluded.revision_uid, time_ms = excluded.time_ms, dismissed = 0,
+                     drive_mtime_ms = excluded.drive_mtime_ms, drive_size = excluded.drive_size`,
             )
-            .run(uid, rel, reason, revisionUid, Date.now());
+            .run(uid, rel, reason, revisionUid, Date.now(), drive.mtimeMs, drive.size);
         this.skipped++;
         this.record(
             'skipped',
@@ -440,6 +455,20 @@ export class Mirror {
                 ? 'changed on Drive, but the local copy was edited; not overwriting'
                 : 'a local file with this name already exists (not made by sync); not overwriting',
         );
+    }
+
+    /** Fill in Drive-side details for review items recorded before they were stored. */
+    async fillReviewDetails() {
+        const missing = this.db.prepare('SELECT uid FROM review WHERE dismissed = 0 AND drive_mtime_ms IS NULL').all() as {
+            uid: string;
+        }[];
+        for (const { uid } of missing) {
+            const node = await this.client.getNode(uid);
+            const revision = node.activeRevision;
+            this.db
+                .prepare('UPDATE review SET drive_mtime_ms = ?, drive_size = ? WHERE uid = ?')
+                .run((revision?.claimedModificationTime ?? node.modificationTime).getTime(), revision?.claimedSize ?? null, uid);
+        }
     }
 
     private clearReview(uid: string) {
