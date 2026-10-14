@@ -25,7 +25,7 @@ const USAGE = `Usage: npm run pdsync -- <command>
   plan                Dry run of uploading: sync with Drive, then list what
                       would change on Drive. Changes nothing on Drive.
   push <kinds> [--yes]
-                      Upload now, after showing what and asking (kinds: new, moves)
+                      Upload now, after showing what and asking (kinds: new, edits, moves)
   config uploads <kinds>|none
                       Which kinds of local change automatic runs upload
                       (off until you switch them on)
@@ -60,7 +60,7 @@ function checkFolder(folder: string) {
 
 const UPLOAD_KINDS: UploadKind[] = ['new', 'edits', 'moves', 'deletes'];
 // Built so far; the rest are refused until they exist.
-const AVAILABLE_KINDS = new Set<UploadKind>(['new', 'moves']);
+const AVAILABLE_KINDS = new Set<UploadKind>(['new', 'edits', 'moves']);
 
 /** Upload kinds switched on for automatic runs. */
 function enabledKinds(db: DatabaseSync) {
@@ -318,7 +318,7 @@ async function main(command: string | undefined, args: string[]) {
             if (!folder) throw new UserError('No mirror folder yet.');
             acquireLock(STATE_DIR);
             try {
-                await (await openMirror(db, folder)).resolve(uid, action);
+                await (await openMirror(db, folder)).resolve(uid, action, { uploadsEdits: enabledKinds(db).has('edits') });
             } finally {
                 notifyChanged();
             }

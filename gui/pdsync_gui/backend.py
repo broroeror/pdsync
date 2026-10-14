@@ -327,6 +327,11 @@ class Backend(QObject):
     def loginError(self) -> str:
         return self._login_error
 
+    @Property(bool, notify=changed)
+    def uploadsEdits(self) -> bool:
+        """True when local edits go up to Drive (changes what "Keep mine" does)."""
+        return "edits" in (self._status.get("uploads") or [])
+
     @Property(str, notify=changed)
     def trashDir(self) -> str:
         """Empty = the desktop trash; otherwise the chosen folder."""

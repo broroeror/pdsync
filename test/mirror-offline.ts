@@ -98,6 +98,17 @@ class FakeDrive {
                 this.emit('node_updated', uid);
                 return this.entity(n);
             },
+            getFileRevisionUploader: async (uid: string) => ({
+                uploadFromStream: async (stream: ReadableStream<Uint8Array>) => ({
+                    completion: async () => {
+                        const n = this.nodes.get(uid)!;
+                        n.content = await new Response(stream).text();
+                        n.rev = `${uid}-v${++this.seq}`;
+                        this.emit('node_updated', uid);
+                        return { nodeUid: uid, nodeRevisionUid: n.rev };
+                    },
+                }),
+            }),
             getFileUploader: async (parentUid: string, name: string) => ({
                 uploadFromStream: async (stream: ReadableStream<Uint8Array>) => ({
                     completion: async () => {
@@ -531,7 +542,40 @@ m = await push();
 assert.equal(m.failures, 1);
 assert.equal(await read('occupied.txt'), 'fine');
 assert.equal(drive.nodes.get('ghost2')!.content, 'Drive');
+await fs.rename(path.join(root, 'occupied.txt'), path.join(root, 'fine-again.txt')); // don't leave a clash for later tests
 console.log('✓ a move into a taken name fails politely');
+
+// 19. Edits (stage 2): a new version goes up; Drive changes meanwhile → Review.
+const ALL = new Set(['new', 'edits', 'moves'] as const);
+const songUid = 'TF1';
+await fs.writeFile(path.join(root, 'New Folder 2/Test Folder/song renamed.mp3'), 'tune, remastered');
+const revBefore = drive.nodes.get(songUid)!.rev;
+m = await push(ALL);
+assert.equal(drive.nodes.get(songUid)!.content, 'tune, remastered');
+assert.notEqual(drive.nodes.get(songUid)!.rev, revBefore, 'a new version, not a new file');
+m = await run();
+assert.equal(m.downloaded, 0, 'own new version is not downloaded back');
+assert.ok(!(await planUploads(db, root)).items.some((i) => i.action === 'update'), 'no edit left pending');
+console.log('✓ an edit uploads as a new version of the same file');
+
+// Race: Drive changes the file after planning, before uploading.
+await fs.writeFile(path.join(root, 'New Folder 2/Test Folder/song renamed.mp3'), 'my local take');
+const racePlan = planForKinds(db, await planUploads(db, root), ALL);
+drive.nodes.get(songUid)!.content = 'someone else on Drive';
+drive.nodes.get(songUid)!.rev = 'race-rev';
+m = new Mirror(drive.client(), db, root);
+await m.applyPlan(racePlan, ALL);
+assert.equal(drive.nodes.get(songUid)!.content, 'someone else on Drive', 'never uploaded over a newer Drive version');
+assert.ok(reviewRows().some((r) => r.uid === songUid && r.reason === 'local-edit'));
+assert.equal(await read('New Folder 2/Test Folder/song renamed.mp3'), 'my local take');
+console.log('✓ Drive changed meanwhile: sent to Review, nothing overwritten');
+
+// With edits on, "Keep mine" uploads yours as the next version.
+await new Mirror(drive.client(), db, root).resolve(songUid, 'keep-local', { uploadsEdits: true });
+m = await push(ALL);
+assert.equal(drive.nodes.get(songUid)!.content, 'my local take');
+assert.ok(!reviewRows().some((r) => r.uid === songUid));
+console.log('✓ Keep mine (with edits on) uploads your version as the new one');
 
 await fs.rm(scratch, { recursive: true, force: true });
 console.log('\nall mirror checks passed');

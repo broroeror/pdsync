@@ -550,6 +550,7 @@ export class Mirror {
                 if (item.action === 'create-folder') await this.createFolder(item.rel, parent);
                 else if (item.action === 'upload') await this.uploadNew(item.rel, parent);
                 else if (item.action === 'move') await this.moveOnDrive(item, parent!);
+                else if (item.action === 'update') await this.uploadEdit(item.uid, item.rel);
             }
             if (waiting.length === pending.length) {
                 for (const item of waiting) {
@@ -558,6 +559,53 @@ export class Mirror {
                 break;
             }
             pending = waiting;
+        }
+    }
+
+    /**
+     * A file edited here: upload it as a new version. Right before, check
+     * Drive still has the version sync last synced; if it changed there
+     * meanwhile, send the file to Review instead of uploading over it.
+     * (Drive keeps earlier versions in the file's history either way.)
+     */
+    private async uploadEdit(uid: string, rel: string) {
+        const row = this.getRow(uid);
+        const target = this.abs(rel);
+        try {
+            const node = await this.client.getNode(uid);
+            const current = node.activeRevision;
+            if (!row || !current) throw new Error('the file is no longer on Drive');
+            if (current.uid !== row.revision_uid) {
+                return this.needsReview(uid, rel, 'local-edit', current.uid, {
+                    mtimeMs: (current.claimedModificationTime ?? node.modificationTime).getTime(),
+                    size: current.claimedSize ?? null,
+                });
+            }
+            const before = await fs.stat(target);
+            const uploader = await this.client.getFileRevisionUploader(uid, {
+                mediaType: mediaTypeOf(rel),
+                expectedSize: before.size,
+                modificationTime: before.mtime,
+            });
+            const controller = await uploader.uploadFromStream(Readable.toWeb(createReadStream(target)) as ReadableStream, []);
+            const { nodeRevisionUid } = await controller.completion();
+            this.upsert({
+                uid,
+                type: 'file',
+                rel_path: rel,
+                revision_uid: nodeRevisionUid,
+                local_size: before.size,
+                local_mtime_ms: Math.trunc(before.mtimeMs),
+                local_ino: before.ino,
+            });
+            const after = await fs.stat(target);
+            if (after.size !== before.size || Math.trunc(after.mtimeMs) !== Math.trunc(before.mtimeMs)) {
+                this.warn(`${rel}: changed while it was uploading; the newer version goes up next time`);
+            }
+            this.uploaded++;
+            this.record('upload', rel, 'new version uploaded');
+        } catch (error) {
+            this.fail(rel, 'uploading the new version', friendlyWriteError(error));
         }
     }
 
@@ -924,12 +972,31 @@ export class Mirror {
      * file again; 'keep-both' renames the local file aside (nothing is lost)
      * and then fetches the Drive version under the original name.
      */
-    async resolve(uid: string, action: 'keep-local' | 'keep-both') {
+    async resolve(uid: string, action: 'keep-local' | 'keep-both', { uploadsEdits = false } = {}) {
         const item = this.db.prepare('SELECT * FROM review WHERE uid = ?').get(uid) as
             | { rel_path: string; revision_uid: string }
             | undefined;
         if (!item) throw new Error('That item is no longer waiting for review');
 
+        if (action === 'keep-local' && uploadsEdits) {
+            // Two-way sync: "keep mine" makes the local file the next version of
+            // the Drive file (the Drive version stays in its version history).
+            // Recording Drive's current version as the base, with a size/mtime
+            // that can't match, makes the planner upload it as an edit.
+            const stat = await fs.stat(this.abs(item.rel_path));
+            this.upsert({
+                uid,
+                type: 'file',
+                rel_path: item.rel_path,
+                revision_uid: item.revision_uid,
+                local_size: -1,
+                local_mtime_ms: -1,
+                local_ino: stat.ino,
+            });
+            this.clearReview(uid);
+            this.record('resolved', item.rel_path, 'kept yours; it will be uploaded as the new version on Drive');
+            return;
+        }
         if (action === 'keep-local') {
             this.db.prepare('UPDATE review SET dismissed = 1 WHERE uid = ?').run(uid);
             this.record('resolved', item.rel_path, 'kept the local version');

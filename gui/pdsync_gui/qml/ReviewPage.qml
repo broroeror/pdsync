@@ -11,7 +11,9 @@ ColumnLayout {
         Layout.fillWidth: true
     }
     Label {
-        text: "<b>Keep mine</b> leaves your file as it is (you'll be asked again if it changes on Drive).  "
+        text: (backend.uploadsEdits
+                ? "<b>Keep mine</b> uploads your file as the new version on Drive (the Drive version stays in its version history).  "
+                : "<b>Keep mine</b> leaves your file as it is (you'll be asked again if it changes on Drive).  ")
             + "<b>Keep both</b> renames your file to “… (local copy …)” and downloads the Drive version."
         textFormat: Text.StyledText
         wrapMode: Text.WordWrap
@@ -85,7 +87,7 @@ ColumnLayout {
                         text: "Keep mine"
                         enabled: !backend.busyAction
                         ToolTip.visible: hovered
-                        ToolTip.text: "Leave your file as it is"
+                        ToolTip.text: backend.uploadsEdits ? "Upload your file as the new version on Drive" : "Leave your file as it is"
                         onClicked: backend.resolve(card.modelData.id, "keep-local")
                     }
                     Button {
