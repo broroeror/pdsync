@@ -86,6 +86,23 @@ const read = (rel: string) => fs.readFile(path.join(root, rel), 'utf8');
 const exists = (rel: string) => fs.stat(path.join(root, rel)).then(() => true, () => false);
 const drive = new FakeDrive();
 const db = openState();
+// A scratch trash folder: tests must never touch the real desktop trash.
+const trashDir = path.join(scratch, 'trash');
+await fs.mkdir(trashDir);
+db.prepare("INSERT INTO meta (key, value) VALUES ('trash', ?)").run(trashDir);
+/** Paths (relative to the trash folder's dated subfolder) of everything in the trash. */
+async function trashed(): Promise<string[]> {
+    const out: string[] = [];
+    const walk = async (dir: string, rel: string) => {
+        for (const d of await fs.readdir(dir, { withFileTypes: true })) {
+            const r = rel ? `${rel}/${d.name}` : d.name;
+            if (d.isDirectory()) await walk(path.join(dir, d.name), r);
+            else out.push(r.split('/').slice(1).join('/'));
+        }
+    };
+    await walk(trashDir, '');
+    return out.sort();
+}
 const run = async (opts = {}) => {
     const m = new Mirror(drive.client(), db, root);
     await m.run(opts);
@@ -167,11 +184,12 @@ assert.equal(await exists('gone-renamed.txt'), false);
 assert.equal(m.downloaded, 0);
 console.log('✓ rename does not resurrect a locally deleted file');
 
-// 7. Trashed on Drive: kept locally.
+// 7. Trashed on Drive: the local copy goes to the trash (never deleted).
 drive.update('a', { trashed: true });
 m = await run();
-assert.equal(await read('Documents/renamed.txt'), 'A v1');
-console.log('✓ remote trash keeps the local file');
+assert.equal(await exists('Documents/renamed.txt'), false);
+assert.ok((await trashed()).includes('Documents/renamed.txt'));
+console.log('✓ a file deleted on Drive moves to the trash');
 
 // 8. A failed download leaves no part file and does not advance the cursor.
 drive.add({ uid: 'd', parentUid: 'root', name: 'd.txt', type: 'file', rev: 'd1', content: 'D' });
@@ -223,23 +241,60 @@ const kinds = new Set((db.prepare('SELECT kind FROM activity').all() as any[]).m
 for (const k of ['download', 'move', 'removed', 'skipped', 'failed', 'resolved']) assert.ok(kinds.has(k), `missing ${k}`);
 console.log('✓ activity recorded');
 
-// 14. Copies sync stops tracking are remembered as leftovers, and the upload
-// planner holds them instead of uploading them back.
+// 14. Deletions on Drive vs. the trash, and what the planner makes of them.
 const { planUploads } = await import('../src/plan.ts');
 const leftovers = () => (db.prepare('SELECT rel_path, reason FROM leftovers ORDER BY rel_path').all() as any[]).map((r) => `${r.rel_path}:${r.reason}`);
+let plan;
+
+// Trash unreachable (drive unplugged): keep the copy, don't re-upload it, retry later.
 drive.add({ uid: 'h', parentUid: 'root', name: 'drive-deletes-me.txt', type: 'file', rev: 'h1', content: 'H' });
 await run();
+await fs.rename(trashDir, trashDir + '-unplugged');
 drive.update('h', { trashed: true });
 await run();
+assert.equal(await read('drive-deletes-me.txt'), 'H');
 assert.ok(leftovers().includes('drive-deletes-me.txt:removed-on-drive'));
-let plan = await planUploads(db, root);
-assert.ok(!plan.items.some((i) => i.action === 'upload' && i.rel === 'drive-deletes-me.txt'), 'must not re-upload a Drive deletion');
-assert.ok(plan.held.some((h) => h.rel === 'drive-deletes-me.txt'));
-// Edited afterwards, it's the user's own file again: upload it.
-await fs.writeFile(path.join(root, 'drive-deletes-me.txt'), 'H, but I kept working on it');
 plan = await planUploads(db, root);
-assert.ok(plan.items.some((i) => i.action === 'upload' && i.rel === 'drive-deletes-me.txt'));
-console.log('✓ Drive deletions are not re-uploaded (unless edited afterwards)');
+assert.ok(!plan.items.some((i) => i.action === 'upload' && i.rel === 'drive-deletes-me.txt'), 'must not re-upload a Drive deletion');
+assert.equal(await fs.stat(trashDir).then(() => true, () => false), false, 'never creates the trash folder itself');
+await fs.rename(trashDir + '-unplugged', trashDir);
+await run();
+assert.equal(await exists('drive-deletes-me.txt'), false);
+assert.ok((await trashed()).includes('drive-deletes-me.txt'));
+assert.ok(!leftovers().includes('drive-deletes-me.txt:removed-on-drive'));
+console.log('✓ unreachable trash: copy kept, not re-uploaded, trashed once it is back');
+
+// Edited here, deleted on Drive: the edit wins (kept, and planned for upload).
+drive.add({ uid: 'w', parentUid: 'root', name: 'my-work.txt', type: 'file', rev: 'w1', content: 'W' });
+await run();
+await fs.writeFile(path.join(root, 'my-work.txt'), 'W plus an hour of my work');
+drive.update('w', { trashed: true });
+await run();
+assert.equal(await read('my-work.txt'), 'W plus an hour of my work');
+plan = await planUploads(db, root);
+assert.ok(plan.items.some((i) => i.action === 'upload' && i.rel === 'my-work.txt'));
+console.log('✓ a copy edited here is kept when Drive deletes it (your edit wins)');
+
+// A deleted folder goes to the trash whole when it only holds synced files...
+drive.add({ uid: 'F', parentUid: 'root', name: 'Shared Stuff', type: 'folder' });
+drive.add({ uid: 'F1', parentUid: 'F', name: 'one.txt', type: 'file', rev: 'f1', content: '1' });
+drive.add({ uid: 'F2', parentUid: 'F', name: 'two.txt', type: 'file', rev: 'f2', content: '2' });
+await run();
+drive.update('F', { trashed: true });
+await run();
+assert.equal(await exists('Shared Stuff'), false);
+assert.ok((await trashed()).includes('Shared Stuff/one.txt') && (await trashed()).includes('Shared Stuff/two.txt'));
+// ...but a folder holding your own files keeps them (only synced files go).
+drive.add({ uid: 'G', parentUid: 'root', name: 'Mixed', type: 'folder' });
+drive.add({ uid: 'G1', parentUid: 'G', name: 'synced.txt', type: 'file', rev: 'g1', content: 'S' });
+await run();
+await fs.writeFile(path.join(root, 'Mixed/mine-only.txt'), 'never on Drive');
+drive.update('G', { trashed: true });
+await run();
+assert.equal(await read('Mixed/mine-only.txt'), 'never on Drive');
+assert.equal(await exists('Mixed/synced.txt'), false);
+assert.ok((await trashed()).includes('Mixed/synced.txt'));
+console.log('✓ deleted folders: trashed whole, or only their synced files if you added your own');
 
 // A rename on Drive into a name that's taken leaves the old copy as a leftover.
 drive.add({ uid: 'k', parentUid: 'root', name: 'k-old.txt', type: 'file', rev: 'k1', content: 'K' });

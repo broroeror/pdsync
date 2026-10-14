@@ -8,6 +8,7 @@ import { ApiError } from './api.ts';
 import { acquireLock, lockHolder } from './lock.ts';
 import { finishRun, getMeta, Mirror, openState, setMeta, startRun, STATE_DIR } from './mirror.ts';
 import { planUploads, type Plan } from './plan.ts';
+import { describeTrash, prepareTrashFolder, trashTarget } from './trash.ts';
 import { installService, serviceInfo, serviceStatus, uninstallService } from './service.ts';
 import { AuthError, interactiveLogin, logout, machineLogin, openClient, savedUsername, UserError } from './session.ts';
 
@@ -29,6 +30,9 @@ const USAGE = `Usage: npm run pdsync -- <command>
                       file aside, then fetches the Drive version)
   config folder <dir> Mirror into a different folder from now on (the old
                       folder and its files are left as they are)
+  config trash desktop|<dir>
+                      Where your copy goes when a file is deleted on Drive:
+                      the desktop trash (default) or a folder you choose
   service install [minutes]
                       Run the mirror automatically (default every 5 minutes)
   service status      Show when it runs next
@@ -134,6 +138,7 @@ async function status(db: DatabaseSync) {
               }
             : null,
         reviewCount,
+        trash: trashTarget(db),
         service: serviceInfo(),
     };
 }
@@ -184,6 +189,7 @@ async function main(command: string | undefined, args: string[]) {
                 );
             }
             if (s.reviewCount) console.log(`To review:   ${s.reviewCount} skipped file(s) (see: review)`);
+            console.log(`Drive deletes go to: ${describeTrash(s.trash)}`);
             console.log(`Automatic:   ${s.service.enabled ? (s.service.intervalMinutes ? `every ${s.service.intervalMinutes} min` : 'on') : 'off'}`);
             return;
         }
@@ -252,14 +258,29 @@ async function main(command: string | undefined, args: string[]) {
         }
         case 'config': {
             const [key, value] = positional;
-            if (key !== 'folder' || !value) throw new UserError('Usage: npm run pdsync -- config folder <dir>');
             const db = openState();
+            if (key === 'trash' && value) {
+                if (value === 'desktop') {
+                    db.prepare("DELETE FROM meta WHERE key = 'trash'").run();
+                } else {
+                    let dir;
+                    try {
+                        dir = await prepareTrashFolder(value, getMeta(db, 'root_dir'));
+                    } catch (error) {
+                        throw new UserError((error as Error).message);
+                    }
+                    setMeta(db, 'trash', dir);
+                }
+                notifyChanged();
+                return console.log(`Files deleted on Drive now go to ${describeTrash(trashTarget(db))}.`);
+            }
+            if (key !== 'folder' || !value) throw new UserError('Usage: npm run pdsync -- config folder <dir> | config trash desktop|<dir>');
             const folder = path.resolve(value);
             checkFolder(folder);
             if (folder === getMeta(db, 'root_dir')) return console.log(`Already mirroring into ${folder}.`);
             acquireLock(STATE_DIR);
             // Start the new mirror from scratch; nothing on disk is touched.
-            db.exec("DELETE FROM nodes; DELETE FROM review; DELETE FROM meta WHERE key IN ('event_id', 'scope', 'account');");
+            db.exec("DELETE FROM nodes; DELETE FROM review; DELETE FROM leftovers; DELETE FROM meta WHERE key IN ('event_id', 'scope', 'account', 'layout');");
             setMeta(db, 'root_dir', folder);
             notifyChanged();
             console.log(`From the next run, My Files is mirrored into ${folder}.`);

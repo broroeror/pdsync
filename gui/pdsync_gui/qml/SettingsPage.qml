@@ -45,6 +45,57 @@ ScrollView {
         }
 
         GroupBox {
+            title: "When a file is deleted on Drive"
+            Layout.fillWidth: true
+            ColumnLayout {
+                anchors.fill: parent
+                RadioButton {
+                    text: "Move my copy to the desktop trash"
+                    checked: !backend.trashDir
+                    enabled: !backend.busyAction
+                    // Re-bind so the buttons always show the real setting.
+                    onClicked: {
+                        checked = Qt.binding(() => !backend.trashDir)
+                        if (backend.trashDir) backend.setTrash("desktop")
+                    }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    RadioButton {
+                        text: backend.trashDir ? "Move my copy to" : "Move my copy to a folder I choose…"
+                        checked: !!backend.trashDir
+                        enabled: !backend.busyAction
+                        // Stays as it was if the dialog is cancelled.
+                        onClicked: {
+                            checked = Qt.binding(() => !!backend.trashDir)
+                            trashDialog.open()
+                        }
+                    }
+                    Label {
+                        visible: !!backend.trashDir
+                        text: backend.trashDir
+                        elide: Text.ElideMiddle
+                        Layout.fillWidth: true
+                    }
+                    Button {
+                        visible: !!backend.trashDir
+                        text: "Change…"
+                        enabled: !backend.busyAction
+                        onClicked: trashDialog.open()
+                    }
+                }
+                Label {
+                    text: "Nothing is ever deleted outright, and a copy you changed here is always kept. "
+                        + "A folder on another drive works too; if the drive isn't plugged in, your copy stays put until it is."
+                    wrapMode: Text.WordWrap
+                    opacity: 0.7
+                    font.pointSize: 8.5
+                    Layout.fillWidth: true
+                }
+            }
+        }
+
+        GroupBox {
             title: "Automatic sync"
             Layout.fillWidth: true
             ColumnLayout {
@@ -94,6 +145,12 @@ ScrollView {
             font.pointSize: 8.5
             Layout.fillWidth: true
         }
+    }
+
+    FolderDialog {
+        id: trashDialog
+        title: "Folder for copies of files deleted on Drive"
+        onAccepted: backend.setTrash(String(selectedFolder))
     }
 
     FolderDialog {

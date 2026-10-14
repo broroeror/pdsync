@@ -14,6 +14,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { Writable } from 'node:stream';
 import { DriveEventType, NodeType, type NodeEntity, type ProtonDriveClient } from '@protontech/drive-sdk';
 import { verbose } from './logging.ts';
+import { moveToTrash, trashTarget } from './trash.ts';
 
 export const STATE_DIR = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local/state'), 'pdsync');
 const PART_SUFFIX = '.pdsync-part';
@@ -190,6 +191,7 @@ export class Mirror {
                 setMeta(this.db, 'layout', LAYOUT_VERSION);
             }
             await this.recheckReview();
+            await this.retryTrash();
             return;
         }
 
@@ -197,11 +199,11 @@ export class Mirror {
             switch (event.type) {
                 case DriveEventType.NodeCreated:
                 case DriveEventType.NodeUpdated:
-                    if (event.isTrashed) this.removedRemotely(event.nodeUid);
+                    if (event.isTrashed) await this.removedRemotely(event.nodeUid);
                     else await this.syncByUid(event.nodeUid);
                     break;
                 case DriveEventType.NodeDeleted:
-                    this.removedRemotely(event.nodeUid);
+                    await this.removedRemotely(event.nodeUid);
                     break;
                 case DriveEventType.TreeRefresh:
                     // The server says our cursor is too old to replay: rescan.
@@ -216,6 +218,7 @@ export class Mirror {
 
         if (this.needsRescan && !this.failures) await this.fullWalk(rootNode);
         await this.recheckReview();
+        await this.retryTrash();
     }
 
     private async latestEventId(scope: string) {
@@ -248,13 +251,13 @@ export class Mirror {
         // Skip this if the walk was incomplete, or we'd misreport removals.
         if (this.failures) return;
         const rows = this.db.prepare('SELECT uid FROM nodes').all() as { uid: string }[];
-        for (const { uid } of rows) if (!seen.has(uid)) this.removedRemotely(uid);
+        for (const { uid } of rows) if (!seen.has(uid)) await this.removedRemotely(uid);
     }
 
     private async syncByUid(uid: string) {
         try {
             const node = await this.client.getNode(uid);
-            if (node.trashTime) return this.removedRemotely(uid);
+            if (node.trashTime) return await this.removedRemotely(uid);
             const parentRel = await this.parentRelOf(node, 0);
             // null = not inside My Files (e.g. another tree on the volume).
             if (parentRel !== null) await this.syncNode(node, parentRel);
@@ -472,25 +475,121 @@ export class Mirror {
         this.needsRescan = true;
     }
 
-    private removedRemotely(uid: string) {
+    /**
+     * Deleted (or trashed) on Drive: move the local copy to the trash, never
+     * delete it. Only what sync put there unchanged goes: a copy edited here
+     * is kept (the user's work wins). A folder goes as one piece when it holds
+     * nothing but unedited synced items; otherwise only those items go. If the
+     * trash isn't reachable, everything is kept and retried next run.
+     */
+    private async removedRemotely(uid: string) {
         const row = this.getRow(uid);
         if (!row) return;
-        const forget = this.db.prepare('DELETE FROM nodes WHERE uid = ?');
         const affected = [row];
         if (row.type === 'folder') {
             for (const r of this.db.prepare('SELECT * FROM nodes').all() as Row[]) {
                 if (r.uid !== row.uid && isUnder(r.rel_path, row.rel_path)) affected.push(r);
             }
         }
-        this.leaveBehind(affected, 'removed-on-drive');
-        for (const r of affected) {
-            if (r.uid === uid) continue;
-            forget.run(r.uid);
-            this.clearReview(r.uid);
+        const forget = () => {
+            const del = this.db.prepare('DELETE FROM nodes WHERE uid = ?');
+            for (const r of affected) {
+                del.run(r.uid);
+                this.clearReview(r.uid);
+            }
+        };
+        const target = trashTarget(this.db);
+        const label = row.rel_path + (row.type === 'folder' ? '/' : '');
+
+        if (row.type === 'folder' && (await this.onlyUneditedSynced(row.rel_path, affected))) {
+            const result = await moveToTrash(this.abs(row.rel_path), row.rel_path, target);
+            if (result.ok) this.record('removed', label, `deleted on Drive; moved to ${result.where}`);
+            else {
+                this.leaveBehind(affected, 'removed-on-drive');
+                this.warn(`${label}: deleted on Drive, but ${result.why}; kept for now, will retry`);
+            }
+            forget();
+            return;
         }
-        forget.run(uid);
-        this.clearReview(uid);
-        this.record('removed', row.rel_path + (row.type === 'folder' ? '/' : ''), 'removed on Drive, kept locally');
+
+        let kept = 0;
+        for (const r of affected) {
+            if (r.type === 'folder') continue;
+            const stat = await statOrNull(this.abs(r.rel_path));
+            if (!stat) continue;
+            if (!this.matches(r, stat)) {
+                kept++;
+                this.warn(`${r.rel_path}: deleted on Drive, but you changed it here, so your copy was kept`);
+                continue;
+            }
+            const result = await moveToTrash(this.abs(r.rel_path), r.rel_path, target);
+            if (result.ok) this.record('removed', r.rel_path, `deleted on Drive; moved to ${result.where}`);
+            else {
+                this.leaveBehind([r], 'removed-on-drive');
+                this.warn(`${r.rel_path}: deleted on Drive, but ${result.why}; kept for now, will retry`);
+            }
+        }
+        if (row.type === 'folder' && (await statOrNull(this.abs(row.rel_path)))) {
+            this.record('removed', label, `deleted on Drive; the folder stays because it holds your own files${kept ? ' or changes' : ''}`);
+        }
+        forget();
+    }
+
+    /** True if everything inside the folder is a synced, unedited item. */
+    private async onlyUneditedSynced(folderRel: string, rows: Row[]) {
+        const byPath = new Map(rows.map((r) => [r.rel_path, r]));
+        const walk = async (rel: string): Promise<boolean> => {
+            const entries = await fs.readdir(this.abs(rel), { withFileTypes: true }).catch(() => null);
+            if (!entries) return false;
+            for (const dirent of entries) {
+                const childRel = `${rel}/${dirent.name}`;
+                const r = byPath.get(childRel);
+                if (!r) return false;
+                if (dirent.isDirectory()) {
+                    if (r.type !== 'folder' || !(await walk(childRel))) return false;
+                } else {
+                    const stat = await statOrNull(this.abs(childRel));
+                    if (!stat || r.type === 'folder' || !this.matches(r, stat)) return false;
+                }
+            }
+            return true;
+        };
+        return walk(folderRel);
+    }
+
+    /** Retry trashing copies that couldn't be trashed earlier (e.g. drive was unmounted). */
+    private async retryTrash() {
+        const target = trashTarget(this.db);
+        const pending = this.db
+            .prepare("SELECT * FROM leftovers WHERE reason = 'removed-on-drive' ORDER BY length(rel_path) DESC")
+            .all() as { rel_path: string; type: string; size: number | null; mtime_ms: number | null }[];
+        const drop = this.db.prepare('DELETE FROM leftovers WHERE rel_path = ?');
+        for (const l of pending) {
+            const stat = await statOrNull(this.abs(l.rel_path));
+            if (!stat) {
+                drop.run(l.rel_path);
+                continue;
+            }
+            if (l.type === 'folder') {
+                // Its synced contents were handled above (deepest first); remove
+                // it only if that left it empty.
+                if ((await fs.readdir(this.abs(l.rel_path))).length === 0) {
+                    await fs.rmdir(this.abs(l.rel_path));
+                    drop.run(l.rel_path);
+                }
+                continue;
+            }
+            // Edited since: it's the user's file now, not a leftover.
+            if (stat.size !== l.size || Math.trunc(stat.mtimeMs) !== l.mtime_ms) {
+                drop.run(l.rel_path);
+                continue;
+            }
+            const result = await moveToTrash(this.abs(l.rel_path), l.rel_path, target);
+            if (result.ok) {
+                drop.run(l.rel_path);
+                this.record('removed', l.rel_path, `deleted on Drive; moved to ${result.where}`);
+            }
+        }
     }
 
     private safeName(node: NodeEntity): string | null {

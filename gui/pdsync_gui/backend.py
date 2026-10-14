@@ -327,6 +327,12 @@ class Backend(QObject):
     def loginError(self) -> str:
         return self._login_error
 
+    @Property(str, notify=changed)
+    def trashDir(self) -> str:
+        """Empty = the desktop trash; otherwise the chosen folder."""
+        trash = self._status.get("trash") or {}
+        return trash.get("dir", "") if trash.get("kind") == "folder" else ""
+
     @Property(bool, notify=changed)
     def startAtLogin(self) -> bool:
         return AUTOSTART_FILE.exists()
@@ -365,6 +371,12 @@ class Backend(QObject):
     def chooseFolder(self, url_or_path: str):
         path = QUrl(url_or_path).toLocalFile() if url_or_path.startswith("file:") else url_or_path
         self._action("folder", ["config", "folder", path], then=self.syncNow)
+
+    @Slot(str)
+    def setTrash(self, url_or_path: str):
+        """'desktop', or a folder (path or file: URL) for copies deleted on Drive."""
+        value = QUrl(url_or_path).toLocalFile() if url_or_path.startswith("file:") else url_or_path
+        self._action("trash", ["config", "trash", value or "desktop"])
 
     @Slot(bool, int)
     def setAutoSync(self, enabled: bool, minutes: int):
