@@ -15,7 +15,7 @@ import { Writable } from 'node:stream';
 import { DriveEventType, NodeType, type NodeEntity, type ProtonDriveClient } from '@protontech/drive-sdk';
 import { verbose } from './logging.ts';
 
-const STATE_DIR = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local/state'), 'pdsync');
+export const STATE_DIR = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local/state'), 'pdsync');
 const PART_SUFFIX = '.pdsync-part';
 // Guards against a broken parent chain looping forever.
 const MAX_PARENT_DEPTH = 64;
