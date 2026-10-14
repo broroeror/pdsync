@@ -1,0 +1,44 @@
+# Maintainer: broroeror <54515333+broroeror@users.noreply.github.com>
+#
+# Local build: `makepkg -si` in this folder builds from the project's git
+# repository (committed state only). Before publishing to the AUR, point
+# `source` at the public repository and pin a tag.
+pkgname=pdsync
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Unofficial Linux mirror client for Proton Drive (third-party, not supported by Proton)"
+arch=('any')
+license=('GPL-3.0-or-later')
+depends=('nodejs>=22' 'python' 'pyside6' 'libsecret' 'systemd')
+makedepends=('git' 'npm')
+source=("$pkgname::git+file://$(realpath "$startdir/..")")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname"
+  npm ci --ignore-scripts --no-audit --no-fund
+  node build.mjs
+}
+
+check() {
+  cd "$pkgname"
+  npm test
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm644 dist/pdsync.mjs "$pkgdir/usr/lib/pdsync/pdsync.mjs"
+  install -Dm644 dist/pdsync.mjs.LEGAL.txt "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-NOTICES.txt"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  # Desktop app (Python package in a private directory).
+  find gui/pdsync_gui -type f \( -name '*.py' -o -name '*.qml' -o -name '*.svg' \) -exec \
+    install -Dm644 '{}' "$pkgdir/usr/lib/pdsync/{}" \;
+  install -Dm644 gui/pdsync_gui/icons/pdsync.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/pdsync.svg"
+
+  install -Dm755 packaging/pdsync "$pkgdir/usr/bin/pdsync"
+  install -Dm755 packaging/pdsync-gui "$pkgdir/usr/bin/pdsync-gui"
+  install -Dm644 packaging/pdsync-gui.desktop "$pkgdir/usr/share/applications/pdsync-gui.desktop"
+  install -Dm644 packaging/pdsync-mirror.service "$pkgdir/usr/lib/systemd/user/pdsync-mirror.service"
+  install -Dm644 packaging/pdsync-mirror.timer "$pkgdir/usr/lib/systemd/user/pdsync-mirror.timer"
+}

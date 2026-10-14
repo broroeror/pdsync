@@ -1,0 +1,8 @@
+[Unit]
+Description=Download-only Drive mirror (third-party, not supported by Proton)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/pdsync mirror
+Nice=10
+IOSchedulingClass=idle

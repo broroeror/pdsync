@@ -1,0 +1,4 @@
+#!/bin/sh
+export PDSYNC_BIN=/usr/bin/pdsync
+export PYTHONPATH=/usr/lib/pdsync/gui${PYTHONPATH:+:$PYTHONPATH}
+exec python3 -m pdsync_gui "$@"

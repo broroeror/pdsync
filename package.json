@@ -1,17 +1,15 @@
 {
   "name": "proton-drive-sync",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "version": "0.1.0",
+  "description": "Unofficial Linux mirror client for Proton Drive (third-party, not supported by Proton)",
   "scripts": {
     "test": "tsx --import ./src/preload.ts test/crypto-offline.ts && tsx --import ./src/preload.ts test/pubkey-offline.ts && tsx --import ./src/preload.ts test/client-offline.ts && tsx --import ./src/preload.ts test/mirror-offline.ts && tsx --import ./src/preload.ts test/lock-offline.ts",
     "typecheck": "tsc -p .",
     "pdsync": "tsx --import ./src/preload.ts src/cli.ts",
-    "test:keyring": "tsx --import ./src/preload.ts test/keyring-roundtrip.ts"
+    "test:keyring": "tsx --import ./src/preload.ts test/keyring-roundtrip.ts",
+    "build": "node build.mjs"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "license": "GPL-3.0-or-later",
   "type": "module",
   "dependencies": {
     "@protontech/crypto": "^2.2.0",
@@ -19,6 +17,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
+    "esbuild": "^0.28.2",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   }

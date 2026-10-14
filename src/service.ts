@@ -1,5 +1,9 @@
-// Installs a systemd *user* timer that runs `mirror` periodically: runs as
-// the user, only while they're logged in, no root, logs to the journal.
+// Runs `mirror` periodically through a systemd *user* timer: as the user,
+// only while they're logged in, no root, logs to the journal.
+//
+// Installed package: the units ship in /usr/lib/systemd/user and the chosen
+// interval is a per-user drop-in. From source: full units are written to
+// ~/.config/systemd/user, pointing at this checkout.
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -9,9 +13,16 @@ import type { DatabaseSync } from 'node:sqlite';
 import { getMeta } from './mirror.ts';
 import { UserError } from './session.ts';
 
+// Defined by the bundler for the installed build.
+declare const PDSYNC_PACKAGED: boolean | undefined;
+const PACKAGED = typeof PDSYNC_PACKAGED !== 'undefined' && PDSYNC_PACKAGED;
+
 const UNIT = 'pdsync-mirror';
 const UNIT_DIR = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'systemd/user');
-const PROJECT_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const DROP_IN = path.join(UNIT_DIR, `${UNIT}.timer.d`, 'interval.conf');
+const PACKAGED_TIMER = `/usr/lib/systemd/user/${UNIT}.timer`;
+// Marks unit files we wrote ourselves (so we only ever delete our own).
+const DESCRIPTION = 'Download-only Drive mirror (third-party, not supported by Proton)';
 const DEFAULT_INTERVAL_MINUTES = 5;
 
 function systemctl(...args: string[]) {
@@ -41,46 +52,58 @@ function quote(arg: string) {
     return `"${arg.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
+/** Remove units written by a from-source install, which would shadow the packaged ones. */
+function removeOwnUserUnits() {
+    for (const ext of ['service', 'timer']) {
+        const file = path.join(UNIT_DIR, `${UNIT}.${ext}`);
+        try {
+            const text = fs.readFileSync(file, 'utf8');
+            if (text.includes(DESCRIPTION) || text.includes('Run the Drive mirror every')) fs.rmSync(file);
+        } catch {
+            // Not there.
+        }
+    }
+}
+
+function writeSourceUnits(intervalMinutes: number) {
+    const projectDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+    // Absolute node path: user-local installs (~/.local/bin) aren't on systemd's PATH.
+    const exec = [nodePath(), '--import', 'tsx', '--import', './src/preload.ts', 'src/cli.ts', 'mirror'];
+    fs.mkdirSync(UNIT_DIR, { recursive: true });
+    fs.writeFileSync(
+        path.join(UNIT_DIR, `${UNIT}.service`),
+        `[Unit]\nDescription=${DESCRIPTION}\n\n[Service]\nType=oneshot\nWorkingDirectory=${projectDir}\n` +
+            `ExecStart=${exec.map(quote).join(' ')}\nNice=10\nIOSchedulingClass=idle\n`,
+    );
+    fs.writeFileSync(
+        path.join(UNIT_DIR, `${UNIT}.timer`),
+        `[Unit]\nDescription=Run the Drive mirror every ${intervalMinutes} minutes\n\n[Timer]\nOnStartupSec=2min\n` +
+            `OnUnitActiveSec=${intervalMinutes}min\n\n[Install]\nWantedBy=timers.target\n`,
+    );
+}
+
 export function installService(db: DatabaseSync, intervalMinutes = DEFAULT_INTERVAL_MINUTES) {
     if (!getMeta(db, 'root_dir') || !getMeta(db, 'event_id')) {
-        throw new UserError('Run a mirror by hand first (npm run pdsync -- mirror <folder>), so the folder is known.');
+        throw new UserError('Run a first mirror before turning on automatic sync, so the folder is known.');
     }
     if (!Number.isInteger(intervalMinutes) || intervalMinutes < 1) {
         throw new UserError('The interval must be a whole number of minutes, at least 1.');
     }
 
-    // Absolute node path: user-local installs (~/.local/bin) aren't on systemd's PATH.
-    const exec = [nodePath(), '--import', 'tsx', '--import', './src/preload.ts', 'src/cli.ts', 'mirror'];
-
-    const service = `[Unit]
-Description=Download-only Drive mirror (third-party, not supported by Proton)
-
-[Service]
-Type=oneshot
-WorkingDirectory=${PROJECT_DIR}
-ExecStart=${exec.map(quote).join(' ')}
-Nice=10
-IOSchedulingClass=idle
-`;
-    const timer = `[Unit]
-Description=Run the Drive mirror every ${intervalMinutes} minutes
-
-[Timer]
-OnStartupSec=2min
-OnUnitActiveSec=${intervalMinutes}min
-
-[Install]
-WantedBy=timers.target
-`;
-    fs.mkdirSync(UNIT_DIR, { recursive: true });
-    fs.writeFileSync(path.join(UNIT_DIR, `${UNIT}.service`), service);
-    fs.writeFileSync(path.join(UNIT_DIR, `${UNIT}.timer`), timer);
+    if (PACKAGED) {
+        removeOwnUserUnits();
+        fs.mkdirSync(path.dirname(DROP_IN), { recursive: true });
+        // An empty assignment clears the packaged interval before setting ours.
+        fs.writeFileSync(DROP_IN, `[Timer]\nOnUnitActiveSec=\nOnUnitActiveSec=${intervalMinutes}min\n`);
+    } else {
+        writeSourceUnits(intervalMinutes);
+    }
     systemctl('daemon-reload');
-    systemctl('enable', '--now', `${UNIT}.timer`);
-    console.log(`Installed. The mirror now runs every ${intervalMinutes} minutes while you're logged in.`);
-    console.log(`  Status:  npm run pdsync -- service status`);
-    console.log(`  Log:     journalctl --user -u ${UNIT}`);
-    console.log(`  Remove:  npm run pdsync -- service uninstall`);
+    systemctl('enable', `${UNIT}.timer`);
+    // Restart so a changed interval takes effect now.
+    systemctl('restart', `${UNIT}.timer`);
+    console.log(`Automatic sync is on: every ${intervalMinutes} minutes while you're logged in.`);
+    console.log(`  Log:  journalctl --user -u ${UNIT}`);
 }
 
 export function uninstallService() {
@@ -89,9 +112,19 @@ export function uninstallService() {
     } catch {
         // Not installed or already disabled; still remove any files below.
     }
-    for (const ext of ['service', 'timer']) fs.rmSync(path.join(UNIT_DIR, `${UNIT}.${ext}`), { force: true });
+    fs.rmSync(DROP_IN, { force: true });
+    if (!PACKAGED) removeOwnUserUnits();
     systemctl('daemon-reload');
-    console.log('Removed. The mirror no longer runs automatically; your mirrored files are untouched.');
+    console.log('Automatic sync is off; your mirrored files are untouched.');
+}
+
+function intervalIn(file: string): number | null {
+    try {
+        const matches = [...fs.readFileSync(file, 'utf8').matchAll(/^OnUnitActiveSec=(\d+)min$/gm)];
+        return matches.length ? Number(matches.at(-1)![1]) : null;
+    } catch {
+        return null;
+    }
 }
 
 /** Next trigger time. Our timer is interval-based (monotonic), so the wall-clock
@@ -114,13 +147,9 @@ export function serviceInfo(): ServiceInfo {
     } catch {
         // is-active exits non-zero when inactive.
     }
-    let intervalMinutes: number | null = null;
-    try {
-        const timer = fs.readFileSync(path.join(UNIT_DIR, `${UNIT}.timer`), 'utf8');
-        intervalMinutes = Number(timer.match(/^OnUnitActiveSec=(\d+)min$/m)?.[1]) || null;
-    } catch {
-        // Not installed.
-    }
+    const intervalMinutes = PACKAGED
+        ? (intervalIn(DROP_IN) ?? intervalIn(PACKAGED_TIMER))
+        : intervalIn(path.join(UNIT_DIR, `${UNIT}.timer`));
     return { enabled, intervalMinutes, nextRunMs: enabled ? nextRunMs() : null };
 }
 

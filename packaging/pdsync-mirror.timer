@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the Drive mirror periodically
+
+[Timer]
+OnStartupSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

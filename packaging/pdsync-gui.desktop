@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=pdsync
+GenericName=Drive Mirror
+Comment=Mirror your Proton Drive into a local folder (unofficial, third-party)
+Exec=pdsync-gui
+Icon=pdsync
+Terminal=false
+Categories=Network;FileTransfer;Qt;
+Keywords=cloud;sync;drive;backup;
+StartupWMClass=pdsync-gui
