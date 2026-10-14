@@ -7,6 +7,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { ApiError } from './api.ts';
 import { acquireLock, lockHolder } from './lock.ts';
 import { finishRun, getMeta, Mirror, openState, setMeta, startRun, STATE_DIR } from './mirror.ts';
+import { planUploads, type Plan } from './plan.ts';
 import { installService, serviceInfo, serviceStatus, uninstallService } from './service.ts';
 import { AuthError, interactiveLogin, logout, machineLogin, openClient, savedUsername, UserError } from './session.ts';
 
@@ -18,6 +19,8 @@ const USAGE = `Usage: npm run pdsync -- <command>
   mirror [folder]     Download My Files into a folder (download-only: never
                       deletes or uploads). The folder is remembered after the
                       first run. Add --full to rescan everything.
+  plan                Dry run of uploading: sync with Drive, then list what
+                      would change on Drive. Changes nothing on Drive.
   status              Login, folder, last run, automatic sync
   activity            Recent downloads, moves, removals and warnings
   review              Files the mirror skipped and why
@@ -88,6 +91,30 @@ async function runMirror(db: DatabaseSync, given: string | undefined, full: bool
     if (mirror.failures) process.exitCode = 1;
 }
 
+function printPlan(plan: Plan) {
+    if (plan.blocked) return console.log(`\n${plan.blocked}`);
+    const size = (n: number) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`);
+    const groups: [string, string[]][] = [
+        ['Would create on Drive', plan.items.flatMap((i) => (i.action === 'create-folder' ? [`+ ${i.rel}/`] : []))],
+        ['Would rename or move on Drive', plan.items.flatMap((i) => (i.action === 'move' ? [`→ ${i.from}  →  ${i.to}`] : []))],
+        ['Would upload (new)', plan.items.flatMap((i) => (i.action === 'upload' ? [`+ ${i.rel}  (${size(i.size)})`] : []))],
+        ['Would upload a new version (edited here)', plan.items.flatMap((i) => (i.action === 'update' ? [`~ ${i.rel}  (${size(i.size)})`] : []))],
+        [
+            "Would move to Drive's trash (recoverable)",
+            plan.items.flatMap((i) => (i.action === 'trash' ? [`✕ ${i.rel}${i.type === 'folder' ? `/  (${i.files} files)` : ''}`] : [])),
+        ],
+        ['Held back', plan.held.map((h) => `· ${h.rel ? `${h.rel}: ` : ''}${h.why}`)],
+    ];
+    console.log('');
+    if (!plan.items.length && !plan.held.length) return console.log('Nothing to upload: Drive already matches your folder.');
+    for (const [title, lines] of groups) {
+        if (!lines.length) continue;
+        console.log(`${title}:`);
+        for (const line of lines) console.log(`  ${line}`);
+    }
+    console.log('\nThis was a dry run: nothing was changed on Drive.');
+}
+
 async function status(db: DatabaseSync) {
     const lastRun = db.prepare('SELECT * FROM runs WHERE finished_ms IS NOT NULL ORDER BY id DESC LIMIT 1').get() as any;
     const reviewCount = (db.prepare('SELECT COUNT(*) AS n FROM review WHERE dismissed = 0').get() as any).n;
@@ -136,6 +163,14 @@ async function main(command: string | undefined, args: string[]) {
         }
         case 'mirror':
             return runMirror(openState(), positional[0], args.includes('--full'));
+        case 'plan': {
+            const db = openState();
+            // Catch up with Drive first, so conflicts are already in Review.
+            await runMirror(db, undefined, false);
+            const plan = await planUploads(db, getMeta(db, 'root_dir')!);
+            if (json) return console.log(JSON.stringify(plan));
+            return printPlan(plan);
+        }
         case 'status': {
             const s = await status(openState());
             if (json) return console.log(JSON.stringify(s));

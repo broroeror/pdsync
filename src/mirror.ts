@@ -29,7 +29,12 @@ type Row = {
     revision_uid: string | null;
     local_size: number | null;
     local_mtime_ms: number | null;
+    // Disk identity (inode) of what we wrote: survives renames, so a local
+    // rename can be told apart from delete + new file.
+    local_ino?: number | null;
 };
+
+export type { Row as NodeRow };
 
 export function openState() {
     mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
@@ -77,6 +82,8 @@ export function openState() {
     const reviewColumns = new Set((db.prepare('PRAGMA table_info(review)').all() as { name: string }[]).map((c) => c.name));
     if (!reviewColumns.has('drive_mtime_ms')) db.exec('ALTER TABLE review ADD COLUMN drive_mtime_ms INTEGER');
     if (!reviewColumns.has('drive_size')) db.exec('ALTER TABLE review ADD COLUMN drive_size INTEGER');
+    const nodeColumns = new Set((db.prepare('PRAGMA table_info(nodes)').all() as { name: string }[]).map((c) => c.name));
+    if (!nodeColumns.has('local_ino')) db.exec('ALTER TABLE nodes ADD COLUMN local_ino INTEGER');
     return db;
 }
 
@@ -253,7 +260,16 @@ export class Mirror {
         if (node.type === NodeType.Folder) {
             if (row && row.rel_path !== rel) await this.moveFolder(row.rel_path, rel);
             await fs.mkdir(this.abs(rel), { recursive: true });
-            this.upsert({ uid: node.uid, type: 'folder', rel_path: rel, revision_uid: null, local_size: null, local_mtime_ms: null });
+            const { ino } = await fs.stat(this.abs(rel));
+            this.upsert({
+                uid: node.uid,
+                type: 'folder',
+                rel_path: rel,
+                revision_uid: null,
+                local_size: null,
+                local_mtime_ms: null,
+                local_ino: ino,
+            });
             return;
         }
         if (node.type !== NodeType.File) return;
@@ -307,6 +323,7 @@ export class Mirror {
                 revision_uid: revisionUid,
                 local_size: stat.size,
                 local_mtime_ms: Math.trunc(stat.mtimeMs),
+                local_ino: stat.ino,
             });
             this.downloaded++;
             this.clearReview(node.uid);
@@ -417,13 +434,14 @@ export class Mirror {
     private upsert(r: Row) {
         this.db
             .prepare(
-                `INSERT INTO nodes (uid, type, rel_path, revision_uid, local_size, local_mtime_ms)
-                 VALUES (?, ?, ?, ?, ?, ?)
+                `INSERT INTO nodes (uid, type, rel_path, revision_uid, local_size, local_mtime_ms, local_ino)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(uid) DO UPDATE SET type = excluded.type, rel_path = excluded.rel_path,
                      revision_uid = excluded.revision_uid, local_size = excluded.local_size,
-                     local_mtime_ms = excluded.local_mtime_ms`,
+                     local_mtime_ms = excluded.local_mtime_ms,
+                     local_ino = COALESCE(excluded.local_ino, nodes.local_ino)`,
             )
-            .run(r.uid, r.type, r.rel_path, r.revision_uid, r.local_size, r.local_mtime_ms);
+            .run(r.uid, r.type, r.rel_path, r.revision_uid, r.local_size, r.local_mtime_ms, r.local_ino ?? null);
     }
 
     private needsReview(
