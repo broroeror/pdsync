@@ -25,7 +25,9 @@ export class ApiError extends Error {
 
 export class Api {
     session?: Session;
-    onSessionChange?: (session: Session) => void;
+    /** Awaited before a refreshed session is used: refresh tokens are single-use. */
+    onSessionChange?: (session: Session) => Promise<void>;
+    private refreshing?: Promise<void>;
 
     private sessionHeaders(headers: Headers) {
         headers.set('x-pm-appversion', APP_VERSION);
@@ -49,9 +51,10 @@ export class Api {
             });
         };
 
+        const tokenUsed = this.session?.accessToken;
         let response = await send();
         if (response.status === 401 && this.session) {
-            await this.refresh();
+            await this.refreshIfStale(tokenUsed);
             response = await send();
         }
 
@@ -60,6 +63,17 @@ export class Api {
             throw new ApiError(response.status, body.Code, body.Error ?? response.statusText, body);
         }
         return body as T;
+    }
+
+    /**
+     * Refresh after a 401, unless another request already did. Concurrent
+     * callers share one refresh: refresh tokens rotate, so a second refresh
+     * with the old token would fail (and may end the session).
+     */
+    private async refreshIfStale(tokenUsed: string | undefined) {
+        if (this.session && this.session.accessToken !== tokenUsed) return;
+        this.refreshing ??= this.refresh().finally(() => (this.refreshing = undefined));
+        await this.refreshing;
     }
 
     async refresh() {
@@ -85,7 +99,7 @@ export class Api {
             throw new ApiError(401, body.Code, `Session refresh failed: ${body.Error}`, body);
         }
         this.session = { uid: this.session.uid, accessToken: body.AccessToken, refreshToken: body.RefreshToken };
-        this.onSessionChange?.(this.session);
+        await this.onSessionChange?.(this.session);
     }
 
     /** The HTTP client handed to the SDK. */
@@ -99,7 +113,9 @@ export class Api {
             json?: object;
             body?: any;
         }) => {
+            let tokenUsed: string | undefined;
             const attempt = () => {
+                tokenUsed = this.session?.accessToken;
                 const headers = new Headers(request.headers);
                 // Only API calls carry the session. Block storage URLs live on
                 // other hosts and are authorised by the SDK's own token header.
@@ -124,7 +140,7 @@ export class Api {
 
             let response = await attempt();
             if (response.status === 401 && this.session && request.url.startsWith(API_BASE)) {
-                await this.refresh();
+                await this.refreshIfStale(tokenUsed);
                 response = await attempt();
             }
             return response;
