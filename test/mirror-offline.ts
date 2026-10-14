@@ -138,6 +138,33 @@ assert.equal(await exists('Docs'), false);
 assert.equal(m.downloaded, 0, 'renames should move, not re-download');
 console.log('✓ file + folder renames move local copies');
 
+// 6b. Renaming a locally *edited* file moves it with the edit intact, no copy.
+drive.add({ uid: 'e', parentUid: 'root', name: 'edited.txt', type: 'file', rev: 'e1', content: 'E v1' });
+await run();
+await fs.writeFile(path.join(root, 'edited.txt'), 'E v1 plus my local line');
+drive.update('e', { name: 'edited-renamed.txt' });
+m = await run();
+assert.equal(await read('edited-renamed.txt'), 'E v1 plus my local line');
+assert.equal(await exists('edited.txt'), false);
+assert.equal(m.downloaded, 0, 'no duplicate download');
+// ...and the edit stays protected when Drive later changes the file.
+drive.update('e', { rev: 'e2', content: 'E v2' });
+m = await run();
+assert.equal(await read('edited-renamed.txt'), 'E v1 plus my local line');
+assert.equal(m.skipped, 1);
+await new Mirror(drive.client(), db, root).resolve('e', 'keep-local');
+console.log('✓ rename carries a locally edited file along, edit still protected');
+
+// 6c. Renaming a file whose local copy was deleted doesn't bring it back.
+drive.add({ uid: 'g', parentUid: 'root', name: 'gone.txt', type: 'file', rev: 'g1', content: 'G' });
+await run();
+await fs.rm(path.join(root, 'gone.txt'));
+drive.update('g', { name: 'gone-renamed.txt' });
+m = await run();
+assert.equal(await exists('gone-renamed.txt'), false);
+assert.equal(m.downloaded, 0);
+console.log('✓ rename does not resurrect a locally deleted file');
+
 // 7. Trashed on Drive: kept locally.
 drive.update('a', { trashed: true });
 m = await run();
@@ -164,7 +191,7 @@ console.log('✓ state tied to its folder');
 const reviewRows = () => db.prepare('SELECT uid, reason, dismissed FROM review ORDER BY uid').all() as any[];
 assert.deepEqual(
     reviewRows().map((r) => [r.uid, r.reason, r.dismissed]),
-    [['b', 'local-edit', 0], ['c', 'local-exists', 0]],
+    [['b', 'local-edit', 0], ['c', 'local-exists', 0], ['e', 'local-edit', 1]],
 );
 console.log('✓ skipped files listed for review');
 

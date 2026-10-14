@@ -313,17 +313,29 @@ export class Mirror {
     }
 
     /** Renamed/moved on Drive: move our unedited local copy along. */
+    /**
+     * Renamed/moved on Drive: carry the local file along. A rename changes the
+     * name, not the content, so local edits move with it (and stay protected:
+     * the row still records what sync wrote, so a later Drive change goes to
+     * review). A local copy the user deleted stays deleted.
+     */
     private async moveFile(row: Row, rel: string): Promise<Row | undefined> {
-        const from = await statOrNull(this.abs(row.rel_path));
-        if (from && this.matches(row, from) && !(await statOrNull(this.abs(rel)))) {
-            await fs.mkdir(path.dirname(this.abs(rel)), { recursive: true });
-            await fs.rename(this.abs(row.rel_path), this.abs(rel));
+        const moved = () => {
             this.db.prepare('UPDATE nodes SET rel_path = ? WHERE uid = ?').run(rel, row.uid);
             this.db.prepare('UPDATE review SET rel_path = ? WHERE uid = ?').run(rel, row.uid);
-            this.record('move', rel, row.rel_path);
             return { ...row, rel_path: rel };
+        };
+        const from = await statOrNull(this.abs(row.rel_path));
+        if (!from) return moved();
+        if (!(await statOrNull(this.abs(rel)))) {
+            await fs.mkdir(path.dirname(this.abs(rel)), { recursive: true });
+            await fs.rename(this.abs(row.rel_path), this.abs(rel));
+            this.record('move', rel, row.rel_path);
+            return moved();
         }
-        // Can't move it cleanly: leave the old file alone and fetch a fresh copy.
+        // The new name is taken by another local file: leave both alone and
+        // treat the Drive file as new (it will go to review, not overwrite).
+        this.warn(`${row.rel_path}: renamed on Drive to ${rel}, but a local file already has that name; left as is`);
         this.db.prepare('DELETE FROM nodes WHERE uid = ?').run(row.uid);
         return undefined;
     }
