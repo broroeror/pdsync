@@ -64,10 +64,12 @@ class FakeDrive {
                 return {
                     downloadToStream: (stream: WritableStream) => {
                         const done = (async () => {
+                            // Like the real SDK: write, then release the lock
+                            // without closing; on failure, release and throw.
                             const writer = stream.getWriter();
                             await writer.write(new TextEncoder().encode(node.content!));
+                            writer.releaseLock();
                             if (fail) throw new Error('network went away');
-                            await writer.close();
                         })();
                         return { completion: () => done, isDownloadCompleteWithSignatureIssues: () => false };
                     },

@@ -228,13 +228,20 @@ export class Mirror {
     private async download(node: NodeEntity, rel: string, revisionUid: string, mtime: Date) {
         const target = this.abs(rel);
         const part = path.join(path.dirname(target), `.${path.basename(target)}${PART_SUFFIX}`);
+        let stream: WritableStream | undefined;
         try {
             await fs.mkdir(path.dirname(target), { recursive: true });
             const downloader = await this.client.getFileRevisionDownloader(revisionUid);
             const out = createWriteStream(part);
-            const controller = downloader.downloadToStream(Writable.toWeb(out));
+            stream = Writable.toWeb(out);
+            const controller = downloader.downloadToStream(stream);
             await controller.completion();
-            if (!out.closed) await once(out, 'close');
+            // The SDK only releases its writer when done; closing (which
+            // flushes and closes the file) is up to us.
+            const closed = once(out, 'close');
+            await stream.close();
+            await closed;
+            stream = undefined;
             if (controller.isDownloadCompleteWithSignatureIssues()) {
                 this.warn(`${rel}: downloaded, but its signature could not be verified`);
             }
@@ -252,6 +259,8 @@ export class Mirror {
             this.downloaded++;
             console.log(`↓ ${rel}`);
         } catch (error) {
+            // Release the file handle before removing the part file.
+            await stream?.abort().catch(() => {});
             await fs.rm(part, { force: true });
             this.fail(`downloading ${rel}`, error);
         }
