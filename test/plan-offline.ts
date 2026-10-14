@@ -7,7 +7,7 @@ import path from 'node:path';
 const scratch = await fs.mkdtemp(path.join(process.env.PDSYNC_TEST_TMP || os.tmpdir(), 'pdsync-plan-'));
 process.env.XDG_STATE_HOME = path.join(scratch, 'state');
 const { openState } = await import('../src/mirror.ts');
-const { planUploads } = await import('../src/plan.ts');
+const { planUploads, planForKinds } = await import('../src/plan.ts');
 
 const root = path.join(scratch, 'mirror');
 const db = openState();
@@ -15,7 +15,7 @@ const abs = (rel: string) => path.join(root, rel);
 let uidSeq = 0;
 
 /** A file/folder as sync would have left it, with its state row. */
-async function synced(rel: string, content?: string, opts: { noIno?: boolean } = {}) {
+async function synced(rel: string, content?: string, opts: { noIno?: boolean; link?: boolean } = {}) {
     await fs.mkdir(path.dirname(abs(rel)), { recursive: true });
     if (content === undefined) await fs.mkdir(abs(rel), { recursive: true });
     else await fs.writeFile(abs(rel), content);
@@ -25,7 +25,7 @@ async function synced(rel: string, content?: string, opts: { noIno?: boolean } =
         'INSERT INTO nodes (uid, type, rel_path, revision_uid, local_size, local_mtime_ms, local_ino) VALUES (?, ?, ?, ?, ?, ?, ?)',
     ).run(
         uid,
-        content === undefined ? 'folder' : 'file',
+        content === undefined ? 'folder' : opts.link ? 'link' : 'file',
         rel,
         content === undefined ? null : `${uid}-r1`,
         content === undefined ? null : st.size,
@@ -140,6 +140,38 @@ await fs.rename(abs('draft.txt'), abs('final.txt'));
 await fs.appendFile(abs('final.txt'), ' and more');
 assert.deepEqual(await summary(), ['upload final.txt', 'trash draft.txt (1)']);
 console.log('✓ renamed + edited becomes trash + upload, never a bogus rename');
+
+// 9c. The user's real case: a tracked folder (with a Doc shortcut) moved into
+// a brand-new folder, new files added inside, and only "new" switched on.
+await reset();
+await synced('Test Folder');
+await synced('Test Folder/song.mp3', 'tune');
+await synced('Test Folder/Sample File.desktop', '[Desktop Entry]\nType=Link\n', { link: true });
+await fs.mkdir(abs('New Folder'));
+await fs.rename(abs('Test Folder'), abs('New Folder/Test Folder'));
+await fs.writeFile(abs('New Folder/Test Folder/fresh.docx'), 'D');
+await fs.writeFile(abs('New Folder/top.txt'), 'T');
+const full = await planUploads(db, root);
+assert.ok(!full.items.some((i) => 'rel' in i && i.rel.endsWith('.desktop')), 'a shortcut is never planned for upload');
+const onlyNew = planForKinds(db, full, new Set(['new']));
+assert.deepEqual(onlyNew.items.map((i) => ('rel' in i ? i.rel : '')), ['New Folder', 'New Folder/top.txt']);
+const waiting = onlyNew.held.find((h) => h.rel === 'New Folder/Test Folder/fresh.docx');
+assert.match(waiting?.why ?? '', /waits for "Test Folder" to be moved/);
+console.log('✓ uploads into a moved folder wait for the move; the shortcut is never offered');
+
+// With moves switched on too, the same files can go (folder exists after the move).
+const withMoves = planForKinds(db, full, new Set(['new', 'moves']));
+assert.ok(withMoves.items.some((i) => i.action === 'upload' && i.rel === 'New Folder/Test Folder/fresh.docx'));
+console.log('✓ with moves on, those uploads follow the move');
+
+// A shortcut moved on its own (same disk identity) is still never uploaded.
+await reset();
+await synced('Docs');
+await synced('Docs/Plan.desktop', '[Desktop Entry]\nType=Link\n', { link: true });
+await fs.mkdir(abs('Elsewhere'));
+await fs.rename(abs('Docs/Plan.desktop'), abs('Elsewhere/Plan.desktop'));
+assert.ok(!(await summary()).some((line) => line.includes('.desktop')));
+console.log('✓ a shortcut moved by itself is never uploaded');
 
 // 10. A missing or empty folder blocks everything (unmounted drive).
 await reset();

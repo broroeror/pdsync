@@ -7,9 +7,9 @@ import type { DatabaseSync } from 'node:sqlite';
 import { ApiError } from './api.ts';
 import { acquireLock, lockHolder } from './lock.ts';
 import { randomUUID } from 'node:crypto';
-import { finishRun, getMeta, kindOf, Mirror, openState, setMeta, startRun, STATE_DIR, type UploadKind } from './mirror.ts';
+import { finishRun, getMeta, Mirror, openState, setMeta, startRun, STATE_DIR, type UploadKind } from './mirror.ts';
 import { ask } from './prompt.ts';
-import { planUploads, type Plan } from './plan.ts';
+import { planForKinds, planUploads, type Plan } from './plan.ts';
 import { describeTrash, prepareTrashFolder, trashTarget } from './trash.ts';
 import { installService, serviceInfo, serviceStatus, uninstallService } from './service.ts';
 import { AuthError, interactiveLogin, logout, machineLogin, openClient, savedUsername, UserError } from './session.ts';
@@ -96,7 +96,7 @@ async function runMirror(
     full: boolean,
     // Upload kinds to carry out after catching up; default: those switched on.
     // `confirm` sees the items first and may cancel.
-    upload: { kinds?: Set<UploadKind>; confirm?: (items: Plan['items']) => Promise<boolean> } = {},
+    upload: { kinds?: Set<UploadKind>; confirm?: (plan: Plan) => Promise<boolean> } = {},
 ) {
     const folder = given ? path.resolve(given) : getMeta(db, 'root_dir');
     if (!folder) throw new UserError('First run: say which folder to mirror into, e.g.  npm run pdsync -- mirror ~/DriveMirror');
@@ -111,11 +111,13 @@ async function runMirror(
         await mirror.run({ full });
         const kinds = upload.kinds ?? enabledKinds(db);
         if (kinds.size && !mirror.failures) {
-            const plan = await planUploads(db, folder);
+            const plan = planForKinds(db, await planUploads(db, folder), kinds);
             if (plan.blocked) console.log(plan.blocked);
-            const items = plan.items.filter((i) => kinds.has(kindOf(i)));
-            if (items.length && (!upload.confirm || (await upload.confirm(items)))) {
+            if (plan.items.length && (!upload.confirm || (await upload.confirm(plan)))) {
                 await mirror.applyPlan(plan, kinds);
+            } else if (!plan.items.length && upload.confirm) {
+                printPlan({ items: [], held: plan.held }, 'Will');
+                console.log('\nNothing of that kind to upload right now.');
             }
         }
     } catch (error) {
@@ -222,10 +224,11 @@ async function main(command: string | undefined, args: string[]) {
             const db = openState();
             return runMirror(db, undefined, false, {
                 kinds,
-                confirm: async (items) => {
-                    printPlan({ items, held: [] }, 'Will');
+                confirm: async (plan) => {
+                    printPlan(plan, 'Will');
                     if (args.includes('--yes')) return true;
-                    const answer = await ask(`\nUpload ${items.length === 1 ? 'this' : `these ${items.length} items`} to Drive? [y/N] `);
+                    const n = plan.items.length;
+                    const answer = await ask(`\nUpload ${n === 1 ? 'this' : `these ${n} items`} to Drive? [y/N] `);
                     if (/^y(es)?$/i.test(answer)) return true;
                     console.log('Cancelled; nothing was changed on Drive.');
                     return false;

@@ -19,7 +19,8 @@ import {
     type NodeEntity,
     type ProtonDriveClient,
 } from '@protontech/drive-sdk';
-import type { Plan, PlanItem } from './plan.ts';
+import { kindOf, type Plan, type UploadKind } from './plan.ts';
+export { kindOf, type UploadKind };
 import { verbose } from './logging.ts';
 import { moveToTrash, trashTarget } from './trash.ts';
 
@@ -158,19 +159,6 @@ async function statOrNull(p: string) {
 
 function isUnder(rel: string, folderRel: string) {
     return rel === folderRel || rel.startsWith(folderRel + '/');
-}
-
-/** The kinds of change the user can switch on separately. */
-export type UploadKind = 'new' | 'edits' | 'moves' | 'deletes';
-
-export function kindOf(item: PlanItem): UploadKind {
-    return item.action === 'create-folder' || item.action === 'upload'
-        ? 'new'
-        : item.action === 'update'
-          ? 'edits'
-          : item.action === 'move'
-            ? 'moves'
-            : 'deletes';
 }
 
 function friendlyWriteError(error: unknown) {

@@ -5,7 +5,7 @@
 # `source` at the public repository and pin a tag.
 pkgname=pdsync
 pkgver=0.1.0
-pkgrel=7
+pkgrel=8
 pkgdesc="Unofficial Linux mirror client for Proton Drive (third-party, not supported by Proton)"
 arch=('any')
 license=('GPL-3.0-or-later')
