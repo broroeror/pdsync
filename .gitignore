@@ -1,3 +1,7 @@
 node_modules/
 __pycache__/
 dist/
+packaging/src/
+packaging/pkg/
+packaging/pdsync/
+packaging/*.pkg.tar.*

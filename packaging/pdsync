@@ -1,2 +1,2 @@
 #!/bin/sh
-exec node /usr/lib/pdsync/pdsync.mjs "$@"
+exec /usr/bin/node /usr/lib/pdsync/pdsync.mjs "$@"

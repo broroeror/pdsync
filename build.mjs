@@ -40,11 +40,20 @@ for (const input of Object.keys(result.metafile.inputs)) {
     const match = input.match(/^(.*node_modules\/(?:@[^/]+\/)?[^/]+)\//);
     if (match) packageDirs.add(match[1]);
 }
+// Packages whose npm upload omits the license file.
+const FALLBACK_LICENSES = {
+    // MIT text from github.com/ProtonDriveApps/sdk (LICENSE.md).
+    '@protontech/drive-sdk': () => readFileSync('packaging/licenses/drive-sdk.txt', 'utf8').trim(),
+    // GPL-3.0: the same text as this project's own LICENSE.
+    '@protontech/crypto': () => 'GNU General Public License v3.0: full text in LICENSE (shipped alongside).',
+};
 const sections = [];
 for (const dir of [...packageDirs].sort()) {
     const pkg = JSON.parse(readFileSync(path.join(dir, 'package.json'), 'utf8'));
     const file = readdirSync(dir).find((f) => /^(licen[cs]e|copying)(\.|$)/i.test(f));
-    const text = file ? readFileSync(path.join(dir, file), 'utf8').trim() : `License: ${pkg.license ?? 'unknown'} (no license file shipped)`;
+    const text = file
+        ? readFileSync(path.join(dir, file), 'utf8').trim()
+        : (FALLBACK_LICENSES[pkg.name]?.() ?? `License: ${pkg.license ?? 'unknown'} (no license file shipped)`);
     sections.push(`${pkg.name}@${pkg.version} (${pkg.license ?? 'unknown'})\n${'-'.repeat(60)}\n${text}`);
 }
 writeFileSync('dist/THIRD-PARTY-LICENSES.txt', sections.join('\n\n\n') + '\n');
