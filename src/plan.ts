@@ -32,6 +32,8 @@ export type Plan = {
     held: { rel: string; why: string }[];
     /** Set when the whole plan is refused (e.g. the folder looks unmounted). */
     blocked?: string;
+    /** Deletions held because so many happened at once; need confirming. */
+    massDelete?: { files: number; items: Extract<PlanItem, { action: 'trash' }>[] };
 };
 
 type LocalEntry = { rel: string; type: 'file' | 'folder'; size: number; mtimeMs: number; ino: number };
@@ -76,7 +78,7 @@ async function scanLocal(root: string) {
 const isUnder = (rel: string, folder: string) => rel === folder || rel.startsWith(folder + '/');
 const depth = (rel: string) => rel.split('/').length;
 
-export async function planUploads(db: DatabaseSync, root: string): Promise<Plan> {
+export async function planUploads(db: DatabaseSync, root: string, { allowMassDelete = false } = {}): Promise<Plan> {
     const allRows = db.prepare('SELECT * FROM nodes').all() as NodeRow[];
     // Shortcuts to online documents are sync's own: never uploaded, and
     // deleting one never touches the document on Drive.
@@ -183,18 +185,19 @@ export async function planUploads(db: DatabaseSync, root: string): Promise<Plan>
     const trashedFolders = trashed.filter((r) => r.type === 'folder');
     const fileRows = rows.filter((r) => r.type === 'file');
     let deletedFiles = 0;
-    const trashItems: PlanItem[] = [];
+    const trashItems: Extract<PlanItem, { action: 'trash' }>[] = [];
     for (const row of trashed) {
         if (trashedFolders.some((f) => f.uid !== row.uid && isUnder(row.rel_path, f.rel_path))) continue;
         const files = row.type === 'file' ? 1 : fileRows.filter((f) => isUnder(f.rel_path, row.rel_path)).length;
         deletedFiles += files;
         trashItems.push({ action: 'trash', uid: row.uid, type: row.type, rel: row.rel_path, files });
     }
-    if (deletedFiles >= MASS_DELETE_MIN_FILES && deletedFiles > fileRows.length * MASS_DELETE_SHARE) {
+    if (!allowMassDelete && deletedFiles >= MASS_DELETE_MIN_FILES && deletedFiles > fileRows.length * MASS_DELETE_SHARE) {
         plan.held.push({
             rel: '',
             why: `${deletedFiles} files are gone from the folder at once; their deletion needs your confirmation first`,
         });
+        plan.massDelete = { files: deletedFiles, items: trashItems };
     } else {
         plan.items.push(...trashItems);
     }

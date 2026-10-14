@@ -25,7 +25,10 @@ const USAGE = `Usage: npm run pdsync -- <command>
   plan                Dry run of uploading: sync with Drive, then list what
                       would change on Drive. Changes nothing on Drive.
   push <kinds> [--yes]
-                      Upload now, after showing what and asking (kinds: new, edits, moves)
+                      Upload now, after showing what and asking (kinds: new, edits,
+                      moves, deletes, all). --allow-many confirms a held
+                      mass deletion.
+  restore-deleted     Download again the files whose mass deletion was held
   config uploads <kinds>|none
                       Which kinds of local change automatic runs upload
                       (off until you switch them on)
@@ -60,7 +63,7 @@ function checkFolder(folder: string) {
 
 const UPLOAD_KINDS: UploadKind[] = ['new', 'edits', 'moves', 'deletes'];
 // Built so far; the rest are refused until they exist.
-const AVAILABLE_KINDS = new Set<UploadKind>(['new', 'edits', 'moves']);
+const AVAILABLE_KINDS = new Set<UploadKind>(['new', 'edits', 'moves', 'deletes']);
 
 /** Upload kinds switched on for automatic runs. */
 function enabledKinds(db: DatabaseSync) {
@@ -96,7 +99,7 @@ async function runMirror(
     full: boolean,
     // Upload kinds to carry out after catching up; default: those switched on.
     // `confirm` sees the items first and may cancel.
-    upload: { kinds?: Set<UploadKind>; confirm?: (plan: Plan) => Promise<boolean> } = {},
+    upload: { kinds?: Set<UploadKind>; confirm?: (plan: Plan) => Promise<boolean>; allowMassDelete?: boolean } = {},
 ) {
     const folder = given ? path.resolve(given) : getMeta(db, 'root_dir');
     if (!folder) throw new UserError('First run: say which folder to mirror into, e.g.  npm run pdsync -- mirror ~/DriveMirror');
@@ -111,7 +114,14 @@ async function runMirror(
         await mirror.run({ full });
         const kinds = upload.kinds ?? enabledKinds(db);
         if (kinds.size && !mirror.failures) {
-            const plan = planForKinds(db, await planUploads(db, folder), kinds);
+            const full = await planUploads(db, folder, { allowMassDelete: upload.allowMassDelete });
+            // Remember held mass deletions so the app can ask about them.
+            const held = kinds.has('deletes') ? (full.massDelete?.files ?? 0) : 0;
+            if (String(held) !== (getMeta(db, 'mass_delete_held') ?? '0')) {
+                setMeta(db, 'mass_delete_held', String(held));
+                if (held) console.log(`${held} files were deleted here at once; they were NOT deleted on Drive. Confirm with: push deletes --allow-many, or undo with: restore-deleted`);
+            }
+            const plan = planForKinds(db, full, kinds);
             if (plan.blocked) console.log(plan.blocked);
             if (plan.items.length && (!upload.confirm || (await upload.confirm(plan)))) {
                 await mirror.applyPlan(plan, kinds);
@@ -137,6 +147,7 @@ async function runMirror(
 
     const parts = [`${mirror.downloaded} downloaded`];
     if (mirror.uploaded) parts.push(`${mirror.uploaded} uploaded`);
+    if (mirror.trashedOnDrive) parts.push(`${mirror.trashedOnDrive} moved to Drive's trash`);
     if (mirror.trashed) parts.push(`${mirror.trashed} moved to trash (deleted on Drive)`);
     if (mirror.skipped) parts.push(`${mirror.skipped} skipped (see: review)`);
     if (mirror.failures) parts.push(`${mirror.failures} failed; they will be retried next run`);
@@ -189,6 +200,7 @@ async function status(db: DatabaseSync) {
         reviewCount,
         trash: trashTarget(db),
         uploads: [...enabledKinds(db)],
+        massDeleteHeld: Number(getMeta(db, 'mass_delete_held') ?? 0),
         service: serviceInfo(),
     };
 }
@@ -224,6 +236,7 @@ async function main(command: string | undefined, args: string[]) {
             const db = openState();
             return runMirror(db, undefined, false, {
                 kinds,
+                allowMassDelete: args.includes('--allow-many'),
                 confirm: async (plan) => {
                     printPlan(plan, 'Will');
                     if (args.includes('--yes')) return true;
@@ -234,6 +247,20 @@ async function main(command: string | undefined, args: string[]) {
                     return false;
                 },
             });
+        }
+        case 'restore-deleted': {
+            const db = openState();
+            const folder = getMeta(db, 'root_dir');
+            if (!folder) throw new UserError('No mirror folder yet.');
+            acquireLock(STATE_DIR);
+            const plan = await planUploads(db, folder);
+            if (!plan.massDelete) return console.log('No held deletions to undo.');
+            const mirror = await openMirror(db, folder);
+            mirror.restoreMissing(plan.massDelete.items);
+            setMeta(db, 'mass_delete_held', '0');
+            await mirror.run();
+            notifyChanged();
+            return console.log(`\nRestored: ${mirror.downloaded} files downloaded again.`);
         }
         case 'plan': {
             const db = openState();

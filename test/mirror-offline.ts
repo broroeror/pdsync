@@ -15,6 +15,7 @@ class FakeDrive {
     nodes = new Map<string, FakeNode>();
     events: any[] = [];
     failDownloads = false;
+    trashCalls: string[] = [];
     seq = 0;
 
     constructor() {
@@ -87,6 +88,14 @@ class FakeDrive {
                         continue;
                     }
                     n.parentUid = newParent;
+                    this.emit('node_updated', uid);
+                    yield { uid, ok: true };
+                }
+            }.bind(this),
+            trashNodes: async function* (this: FakeDrive, uids: string[]) {
+                for (const uid of uids) {
+                    this.trashCalls.push(uid);
+                    this.nodes.get(uid)!.trashed = true;
                     this.emit('node_updated', uid);
                     yield { uid, ok: true };
                 }
@@ -576,6 +585,51 @@ m = await push(ALL);
 assert.equal(drive.nodes.get(songUid)!.content, 'my local take');
 assert.ok(!reviewRows().some((r) => r.uid === songUid));
 console.log('✓ Keep mine (with edits on) uploads your version as the new one');
+
+// 20. Deletions (stage 4): local deletes go to Drive's trash.
+const WITH_DELETES = new Set(['new', 'edits', 'moves', 'deletes'] as const);
+drive.add({ uid: 'X1', parentUid: 'root', name: 'delete-me.txt', type: 'file', rev: 'x1', content: 'X' });
+drive.add({ uid: 'XF', parentUid: 'root', name: 'Old Stuff', type: 'folder' });
+drive.add({ uid: 'XF1', parentUid: 'XF', name: 'a.txt', type: 'file', rev: 'xa', content: 'a' });
+drive.add({ uid: 'XF2', parentUid: 'XF', name: 'b.txt', type: 'file', rev: 'xb', content: 'b' });
+await run();
+await fs.rm(path.join(root, 'delete-me.txt'));
+await fs.rm(path.join(root, 'Old Stuff'), { recursive: true });
+await push(new Set(['new', 'edits', 'moves']));
+assert.equal(drive.nodes.get('X1')!.trashed, undefined, 'deletes stay off unless switched on');
+drive.trashCalls = [];
+m = await push(WITH_DELETES);
+assert.ok(drive.nodes.get('X1')!.trashed && drive.nodes.get('XF')!.trashed);
+assert.ok(drive.trashCalls.includes('X1') && drive.trashCalls.includes('XF'));
+assert.ok(!drive.trashCalls.includes('XF1') && !drive.trashCalls.includes('XF2'), 'a deleted folder is one trash action, not one per file');
+m = await run();
+assert.equal(m.downloaded, 0, 'nothing comes back');
+assert.equal(await exists('delete-me.txt'), false);
+console.log("✓ local deletions go to Drive's trash (a folder as one action)");
+
+// Many deletions at once are held; "download them again" restores them...
+drive.add({ uid: 'BULK', parentUid: 'root', name: 'Bulk', type: 'folder' });
+for (let i = 0; i < 14; i++) drive.add({ uid: `B${i}`, parentUid: 'BULK', name: `photo${i}.jpg`, type: 'file', rev: `b${i}`, content: `p${i}` });
+await run();
+await fs.rm(path.join(root, 'Bulk'), { recursive: true });
+drive.trashCalls = [];
+m = await push(WITH_DELETES);
+assert.deepEqual(drive.trashCalls, [], 'mass deletion held');
+const held = await planUploads(db, root);
+assert.equal(held.massDelete?.files, 14);
+m = new Mirror(drive.client(), db, root);
+m.restoreMissing(held.massDelete!.items);
+await m.run();
+assert.equal(await read('Bulk/photo3.jpg'), 'p3');
+console.log('✓ a mass deletion is held, and can be undone (files downloaded again)');
+
+// ...or confirmed, which trashes them on Drive.
+await fs.rm(path.join(root, 'Bulk'), { recursive: true });
+m = new Mirror(drive.client(), db, root);
+await m.run();
+await m.applyPlan(planForKinds(db, await planUploads(db, root, { allowMassDelete: true }), WITH_DELETES), WITH_DELETES);
+assert.ok(drive.nodes.get('BULK')!.trashed);
+console.log("✓ a confirmed mass deletion goes to Drive's trash");
 
 await fs.rm(scratch, { recursive: true, force: true });
 console.log('\nall mirror checks passed');

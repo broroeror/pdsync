@@ -195,6 +195,7 @@ export class Mirror {
     downloaded = 0;
     uploaded = 0;
     trashed = 0;
+    trashedOnDrive = 0;
     skipped = 0;
     // Disk identity -> path of everything in the mirror folder, built on first
     // use per run (to explain what happened to copies renamed locally).
@@ -551,6 +552,7 @@ export class Mirror {
                 else if (item.action === 'upload') await this.uploadNew(item.rel, parent);
                 else if (item.action === 'move') await this.moveOnDrive(item, parent!);
                 else if (item.action === 'update') await this.uploadEdit(item.uid, item.rel);
+                else if (item.action === 'trash') await this.trashOnDrive(item);
             }
             if (waiting.length === pending.length) {
                 for (const item of waiting) {
@@ -607,6 +609,40 @@ export class Mirror {
         } catch (error) {
             this.fail(rel, 'uploading the new version', friendlyWriteError(error));
         }
+    }
+
+    /** Deleted here: move it to Drive's trash (restorable there; never deleted outright). */
+    private async trashOnDrive(item: Extract<PlanItem, { action: 'trash' }>) {
+        const label = item.rel + (item.type === 'folder' ? '/' : '');
+        try {
+            for await (const result of this.client.trashNodes([item.uid])) {
+                if (!result.ok) throw result.error;
+            }
+        } catch (error) {
+            return this.fail(label, "moving to Drive's trash", friendlyWriteError(error));
+        }
+        this.forgetUnder(item.rel);
+        this.trashedOnDrive += item.files;
+        this.record('trashed', label, `deleted here; moved to Drive's trash${item.type === 'folder' ? ` (${item.files} files)` : ''}`);
+    }
+
+    /** Stop tracking a path and everything under it. */
+    private forgetUnder(rel: string) {
+        for (const table of ['nodes', 'review', 'leftovers']) {
+            const rows = this.db.prepare(`SELECT rel_path FROM ${table}`).all() as { rel_path: string }[];
+            const del = this.db.prepare(`DELETE FROM ${table} WHERE rel_path = ?`);
+            for (const { rel_path } of rows) if (isUnder(rel_path, rel)) del.run(rel_path);
+        }
+    }
+
+    /**
+     * Undo a local deletion: forget the missing items so the next full scan
+     * downloads them again (used when many deletions were held and the user
+     * says they were a mistake).
+     */
+    restoreMissing(items: Extract<PlanItem, { action: 'trash' }>[]) {
+        for (const item of items) this.forgetUnder(item.rel);
+        setMeta(this.db, 'layout', '0'); // forces a full scan on the next run
     }
 
     /** A local rename and/or move, carried out on Drive (move first, then rename). */
@@ -1035,7 +1071,7 @@ export class Mirror {
     private record(kind: string, rel: string, detail?: string) {
         addActivity(this.db, kind, rel, detail);
         const symbol =
-            { download: '↓', upload: '↑', created: '+', move: '→', moved: '→', removed: '✕', skipped: '!', failed: '✗', warning: '!', resolved: '✓' }[kind] ??
+            { download: '↓', upload: '↑', created: '+', move: '→', moved: '→', trashed: '✕', removed: '✕', skipped: '!', failed: '✗', warning: '!', resolved: '✓' }[kind] ??
             '·';
         const line = kind === 'move' ? `${symbol} ${detail}  →  ${rel}` : `${symbol} ${rel}${detail ? `: ${detail}` : ''}`;
         (kind === 'failed' ? console.error : kind === 'skipped' || kind === 'warning' ? console.warn : console.log)(line);
