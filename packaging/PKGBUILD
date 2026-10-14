@@ -11,22 +11,22 @@ arch=('any')
 license=('GPL-3.0-or-later')
 depends=('nodejs>=22' 'python' 'pyside6' 'libsecret' 'systemd')
 makedepends=('git' 'npm')
-source=("$pkgname::git+file://$(realpath "$startdir/..")")
+source=("$pkgname-src::git+file://$(realpath "$startdir/..")")
 sha256sums=('SKIP')
 
 build() {
-  cd "$pkgname"
+  cd "$pkgname-src"
   npm ci --ignore-scripts --no-audit --no-fund
   node build.mjs
 }
 
 check() {
-  cd "$pkgname"
+  cd "$pkgname-src"
   npm test
 }
 
 package() {
-  cd "$pkgname"
+  cd "$pkgname-src"
   install -Dm644 dist/pdsync.mjs "$pkgdir/usr/lib/pdsync/pdsync.mjs"
   install -Dm644 dist/pdsync.mjs.LEGAL.txt "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-NOTICES.txt"
   install -Dm644 dist/THIRD-PARTY-LICENSES.txt "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-LICENSES.txt"

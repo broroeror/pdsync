@@ -3,5 +3,5 @@ __pycache__/
 dist/
 packaging/src/
 packaging/pkg/
-packaging/pdsync/
+packaging/pdsync-src/
 packaging/*.pkg.tar.*
