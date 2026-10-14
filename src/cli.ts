@@ -228,7 +228,7 @@ async function main(command: string | undefined, args: string[]) {
                     printPlan(plan, 'Will');
                     if (args.includes('--yes')) return true;
                     const n = plan.items.length;
-                    const answer = await ask(`\nUpload ${n === 1 ? 'this' : `these ${n} items`} to Drive? [y/N] `);
+                    const answer = await ask(`\nMake ${n === 1 ? 'this change' : `these ${n} changes`} on Drive? [y/N] `);
                     if (/^y(es)?$/i.test(answer)) return true;
                     console.log('Cancelled; nothing was changed on Drive.');
                     return false;
