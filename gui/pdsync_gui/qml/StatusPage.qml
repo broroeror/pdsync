@@ -46,6 +46,38 @@ ColumnLayout {
     }
 
     Frame {
+        visible: backend.massDeleteHeld > 0
+        Layout.fillWidth: true
+        ColumnLayout {
+            anchors.fill: parent
+            Label {
+                text: `${backend.massDeleteHeld} files were deleted from your folder at once. To be safe, they were not deleted on Drive.`
+                font.bold: true
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    text: "Was that on purpose?"
+                    opacity: 0.8
+                    Layout.fillWidth: true
+                }
+                Button {
+                    text: "Download them again"
+                    enabled: !backend.busyAction
+                    onClicked: backend.restoreDeleted()
+                }
+                Button {
+                    text: "Move them to Drive's trash"
+                    enabled: !backend.busyAction
+                    onClicked: backend.confirmMassDelete()
+                }
+            }
+        }
+    }
+
+    Frame {
         visible: backend.reviewCount > 0
         Layout.fillWidth: true
         RowLayout {
@@ -80,7 +112,7 @@ ColumnLayout {
         Label {
             anchors.centerIn: parent
             visible: activityList.count === 0
-            text: "Nothing has happened yet. Changes on Drive will show up here."
+            text: "Nothing has happened yet. Changes on either side will show up here."
             opacity: 0.6
         }
 
@@ -94,7 +126,7 @@ ColumnLayout {
                 width: ListView.view.width
                 hoverEnabled: false
                 readonly property var glyphs: ({
-                    download: ["↓", "#2a9d8f"], upload: ["↑", "#2a9d8f"], created: ["+", "#2a9d8f"], move: ["→", "#4a7fc1"], moved: ["→", "#4a7fc1"], removed: ["✕", "#8a9499"],
+                    download: ["↓", "#2a9d8f"], upload: ["↑", "#2a9d8f"], created: ["+", "#2a9d8f"], move: ["→", "#4a7fc1"], moved: ["→", "#4a7fc1"], trashed: ["✕", "#8a9499"], removed: ["✕", "#8a9499"],
                     skipped: ["!", "#e9a23b"], warning: ["!", "#e9a23b"], failed: ["✗", "#d64545"], resolved: ["✓", "#2a9d8f"]
                 })
                 contentItem: RowLayout {

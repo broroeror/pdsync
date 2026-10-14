@@ -45,6 +45,37 @@ ScrollView {
         }
 
         GroupBox {
+            title: "Upload my changes to Drive"
+            Layout.fillWidth: true
+            ColumnLayout {
+                anchors.fill: parent
+                Repeater {
+                    model: [
+                        { kind: "new", label: "New files and folders" },
+                        { kind: "edits", label: "Edited files (as new versions; Drive keeps the old ones)" },
+                        { kind: "moves", label: "Renames and moves" },
+                        { kind: "deletes", label: "Deletions (moved to Drive's trash, restorable there)" },
+                    ]
+                    delegate: CheckBox {
+                        required property var modelData
+                        text: modelData.label
+                        checked: backend.uploadKinds.indexOf(modelData.kind) >= 0
+                        enabled: !backend.busyAction
+                        onToggled: backend.setUploadKind(modelData.kind, checked)
+                    }
+                }
+                Label {
+                    text: "Unticked kinds stay on your computer only. Files changed on both sides always go to Review, "
+                        + "and deleting many files at once always asks first."
+                    wrapMode: Text.WordWrap
+                    opacity: 0.7
+                    font.pointSize: 8.5
+                    Layout.fillWidth: true
+                }
+            }
+        }
+
+        GroupBox {
             title: "When a file is deleted on Drive"
             Layout.fillWidth: true
             ColumnLayout {

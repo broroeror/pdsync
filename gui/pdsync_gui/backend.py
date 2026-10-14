@@ -182,6 +182,13 @@ class Backend(QObject):
             elif state == "error" and self._last_state not in (None, "error"):
                 self.notify.emit("Sync problem", self.lastError or "The last sync had failures.")
             self._last_state = state
+        held = self._status.get("massDeleteHeld", 0)
+        if held and held != getattr(self, "_last_mass_held", 0):
+            self.notify.emit(
+                "Many files deleted at once",
+                f"{held} files were deleted from your folder. They were not deleted on Drive until you confirm.",
+            )
+        self._last_mass_held = held
         count = self._status.get("reviewCount", 0)
         if count > self._last_review_count:
             self.notify.emit("Files need a decision", f"{count} file(s) were skipped to protect your local changes.")
@@ -204,7 +211,7 @@ class Backend(QObject):
             return "setup"
         if last.get("error") or last.get("failures"):
             return "error"
-        if s.get("reviewCount"):
+        if s.get("reviewCount") or s.get("massDeleteHeld"):
             return "attention"
         return "ok"
 
@@ -327,6 +334,16 @@ class Backend(QObject):
     def loginError(self) -> str:
         return self._login_error
 
+    @Property("QStringList", notify=changed)
+    def uploadKinds(self) -> list:
+        """Kinds of local change automatic runs upload: new, edits, moves, deletes."""
+        return list(self._status.get("uploads") or [])
+
+    @Property(int, notify=changed)
+    def massDeleteHeld(self) -> int:
+        """Files deleted here at once, held back from Drive until confirmed."""
+        return self._status.get("massDeleteHeld", 0)
+
     @Property(bool, notify=changed)
     def uploadsEdits(self) -> bool:
         """True when local edits go up to Drive (changes what "Keep mine" does)."""
@@ -376,6 +393,19 @@ class Backend(QObject):
     def chooseFolder(self, url_or_path: str):
         path = QUrl(url_or_path).toLocalFile() if url_or_path.startswith("file:") else url_or_path
         self._action("folder", ["config", "folder", path], then=self.syncNow)
+
+    @Slot(str, bool)
+    def setUploadKind(self, kind: str, enabled: bool):
+        kinds = [k for k in ("new", "edits", "moves", "deletes") if (k == kind and enabled) or (k != kind and k in self.uploadKinds)]
+        self._action("uploads", ["config", "uploads", *kinds] if kinds else ["config", "uploads", "none"])
+
+    @Slot()
+    def confirmMassDelete(self):
+        self._action("deletes", ["push", "deletes", "--allow-many", "--yes"])
+
+    @Slot()
+    def restoreDeleted(self):
+        self._action("restore", ["restore-deleted"])
 
     @Slot(str)
     def setTrash(self, url_or_path: str):
