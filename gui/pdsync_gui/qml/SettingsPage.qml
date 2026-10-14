@@ -42,6 +42,12 @@ ScrollView {
                         Layout.fillWidth: true
                     }
                     Button {
+                        visible: !!backend.folder
+                        text: "Exclusions…"
+                        enabled: !backend.busyAction
+                        onClicked: excludeEditor.openFor(backend.folders.find((f) => f.kind === "myfiles"))
+                    }
+                    Button {
                         text: backend.folder ? "Change…" : "Choose folder…"
                         enabled: !backend.busyAction
                         onClicked: folderDialog.open()
@@ -71,6 +77,11 @@ ScrollView {
                                 elide: Text.ElideRight
                                 Layout.fillWidth: true
                             }
+                        }
+                        Button {
+                            text: "Exclusions…"
+                            enabled: !backend.busyAction
+                            onClicked: excludeEditor.openFor(modelData)
                         }
                         Button {
                             text: "Remove"
@@ -236,6 +247,60 @@ ScrollView {
             font.pointSize: 8.5
             Layout.fillWidth: true
         }
+    }
+
+    Dialog {
+        id: excludeEditor
+        property var folder: null
+        function openFor(f) {
+            folder = f
+            defaultsBox.checked = f.excludeDefaults
+            customArea.text = f.excludeCustom
+            open()
+        }
+        title: folder ? `Never sync in ${folder.kind === "myfiles" ? "My Files" : folder.label}` : ""
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: Math.min(page.width - 40, 520)
+        standardButtons: Dialog.Save | Dialog.Cancel
+        ColumnLayout {
+            width: parent.width
+            CheckBox {
+                id: defaultsBox
+                text: "Skip things that are always regenerated"
+            }
+            Label {
+                text: "node_modules, .git, Python and build caches, virtual environments, .DS_Store, Thumbs.db"
+                opacity: 0.7
+                font.pointSize: 8.5
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+                Layout.leftMargin: 28
+            }
+            Label {
+                text: "Also skip (one per line). A name like  *.iso  or  Temp  matches anywhere; a path like  Projects/old  "
+                    + "skips that folder and everything in it."
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+                Layout.topMargin: 8
+            }
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 120
+                TextArea {
+                    id: customArea
+                    placeholderText: "e.g.\n*.iso\nProjects/old"
+                }
+            }
+            Label {
+                text: "Skipped items are left alone: excluding something never deletes it, here or on Drive."
+                opacity: 0.7
+                font.pointSize: 8.5
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+            }
+        }
+        onAccepted: backend.setExcludes(folder.id, defaultsBox.checked, customArea.text)
     }
 
     FolderDialog {

@@ -80,7 +80,7 @@ def main() -> int:
     open_action = menu.addAction("Open")
     open_action.triggered.connect(show_window)
     sync_action = menu.addAction("Sync now")
-    sync_action.triggered.connect(backend.syncNow)
+    sync_action.triggered.connect(lambda: backend.stopSync() if backend.running else backend.syncNow())
     folder_action = menu.addAction("Open mirror folder")
     folder_action.triggered.connect(backend.openFolder)
     menu.addSeparator()
@@ -94,9 +94,10 @@ def main() -> int:
 
     def update_tray():
         tray.setIcon(icon(TRAY_ICONS[backend.state]))
-        tray.setToolTip(f"pdsync: {backend.stateText}\n{backend.lastRunText}")
+        tray.setToolTip(f"pdsync: {backend.stateText}\n{(backend.running and backend.progressText) or backend.lastRunText}")
         status_action.setText(backend.stateText)
-        sync_action.setEnabled(backend.state not in ("login", "setup", "syncing"))
+        sync_action.setText("Stop syncing" if backend.running else "Sync now")
+        sync_action.setEnabled(backend.state not in ("login", "setup") and backend.busyAction != "stop")
         folder_action.setEnabled(bool(backend.folder))
 
     backend.changed.connect(update_tray)

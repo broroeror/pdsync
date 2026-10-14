@@ -51,6 +51,19 @@ def describe_version(side: dict | None) -> dict:
     }
 
 
+def clock_time(ms: int | None) -> str:
+    """'11:38:24' today (with seconds, so progress is visible), else date + time."""
+    if not ms:
+        return ""
+    locale = QLocale.system()
+    moment = QDateTime.fromMSecsSinceEpoch(int(ms))
+    # The locale's long time format includes seconds; drop any time zone part.
+    time_fmt = locale.timeFormat(QLocale.FormatType.LongFormat).replace(" t", "").replace("t", "").strip()
+    if moment.date() == QDateTime.currentDateTime().date():
+        return locale.toString(moment.time(), time_fmt)
+    return locale.toString(moment, QLocale.FormatType.ShortFormat)
+
+
 def relative_time(ms: int | None, future: bool = False) -> str:
     if not ms:
         return ""
@@ -73,6 +86,8 @@ class Backend(QObject):
     # For the tray: (title, message) worth a desktop notification.
     notify = Signal(str, str)
     showWindowRequested = Signal()
+    # A folder's size, measured before adding it: (path, summary text).
+    folderMeasured = Signal(str, str)
 
     def __init__(self):
         super().__init__()
@@ -87,6 +102,8 @@ class Backend(QObject):
         self._login_proc: QProcess | None = None
         self._procs: set[QProcess] = set()
         self._refreshing = False
+        self._refresh_queued = False
+        self._last_refresh = 0.0
         self._last_state = None
         self._last_review_count = 0
 
@@ -130,6 +147,17 @@ class Backend(QObject):
     def _on_fs_change(self, _path):
         # Editors and the engine replace files; re-add the watch each time.
         self._watch_changed_file()
+        # The engine reports progress about once a second while syncing; each
+        # refresh starts the engine, so refresh at most every 2 seconds.
+        wait = 2000 - int((time.time() - self._last_refresh) * 1000)
+        if wait <= 0:
+            self.refresh()
+        elif not self._refresh_queued:
+            self._refresh_queued = True
+            QTimer.singleShot(wait, self._queued_refresh)
+
+    def _queued_refresh(self):
+        self._refresh_queued = False
         self.refresh()
 
     @Slot()
@@ -137,6 +165,7 @@ class Backend(QObject):
         if self._refreshing:
             return
         self._refreshing = True
+        self._last_refresh = time.time()
         pending = {"n": 3}
 
         def done():
@@ -209,7 +238,7 @@ class Backend(QObject):
             return "syncing"
         if not s.get("folders"):
             return "setup"
-        if last.get("error") or last.get("failures"):
+        if (last.get("error") and last.get("errorKind") != "stopped") or last.get("failures"):
             return "error"
         if s.get("reviewCount") or s.get("massDeleteHeld"):
             return "attention"
@@ -245,6 +274,8 @@ class Backend(QObject):
                 "label": f["label"],
                 "local": f["local"],
                 "pending": not f.get("firstSyncDone"),
+                "excludeDefaults": (f.get("excludes") or {}).get("defaults", True),
+                "excludeCustom": "\n".join((f.get("excludes") or {}).get("custom", [])),
             }
             for f in self._status.get("folders") or []
         ]
@@ -259,6 +290,8 @@ class Backend(QObject):
         if not last:
             return "Not synced yet"
         when = relative_time(last.get("finishedMs"))
+        if last.get("errorKind") == "stopped":
+            return f"Last sync stopped by you at {clock_time(last.get('finishedMs'))}"
         if last.get("error"):
             return f"Last sync {when} failed"
         parts = [f"{last.get('downloaded', 0)} downloaded"]
@@ -267,6 +300,29 @@ class Backend(QObject):
         if last.get("failures"):
             parts.append(f"{last['failures']} failed")
         return f"Last sync {when}: {', '.join(parts)}"
+
+    @Property(str, notify=changed)
+    def progressText(self) -> str:
+        """While syncing: what has happened so far, and when the last change was."""
+        p = self._status.get("progress")
+        if not p:
+            return ""
+        locale = QLocale.system()
+        parts = []
+        for key, label in (("created", "folders created"), ("uploaded", "uploaded"), ("downloaded", "downloaded"),
+                           ("trashedOnDrive", "moved to Drive's trash"), ("trashed", "moved to trash")):
+            if p.get(key):
+                parts.append(f"{locale.toString(p[key])} {label}")
+        text = f"Since {clock_time(p.get('startedMs'))}: " + (", ".join(parts) if parts else "checking for changes")
+        if p.get("lastMs"):
+            item = p.get("lastItem", "")
+            folder = f"{p['folder']} › " if p.get("folder") and len(self._status.get("folders") or []) > 1 else ""
+            text += f"\nLast change {clock_time(p['lastMs'])}: {folder}{item}"
+        return text
+
+    @Property(bool, notify=changed)
+    def running(self) -> bool:
+        return bool(self._status.get("running")) or self._syncing
 
     @Property(str, notify=changed)
     def lastError(self) -> str:
@@ -299,7 +355,7 @@ class Backend(QObject):
                 "path": a["path"],
                 "folder": a.get("folder") or "",
                 "detail": a.get("detail") or "",
-                "when": relative_time(a["timeMs"]),
+                "when": clock_time(a["timeMs"]),
             }
             for a in self._activity
         ]
@@ -455,11 +511,44 @@ class Backend(QObject):
     def openPath(self, local: str):
         QDesktopServices.openUrl(QUrl.fromLocalFile(local))
 
+    @Slot()
+    def stopSync(self):
+        """Stop the running sync safely (it finishes or cancels the current step)."""
+        self._action("stop", ["stop"])
+
     @Slot(str)
     def addFolder(self, url_or_path: str):
-        """Sync a folder from this computer (it appears under Computers on Drive)."""
+        """Measure a folder first; the UI asks before actually adding it."""
         path = QUrl(url_or_path).toLocalFile() if url_or_path.startswith("file:") else url_or_path
-        self._action("folders", ["folders", "add", path], then=self.syncNow)
+        self._busy_action = "measure"
+        self.changed.emit()
+
+        def measured(code, out, err):
+            self._busy_action = ""
+            self.changed.emit()
+            if code != 0:
+                self.notify.emit("Can't add that folder", err.strip().splitlines()[-1] if err.strip() else path)
+                return
+            m = json.loads(out)
+            locale = QLocale.system()
+            size = lambda n: locale.formattedDataSize(n)
+            text = f"{path}\n\n{locale.toString(m['files'])} files ({size(m['bytes'])})."
+            if m["includedFiles"] != m["files"]:
+                text += (f"\nAfter skipping node_modules, .git, caches and similar: "
+                         f"{locale.toString(m['includedFiles'])} files ({size(m['includedBytes'])}).")
+            self.folderMeasured.emit(path, text)
+
+        self._run(["folders", "measure", path, "--json"], measured)
+
+    @Slot(str)
+    def addFolderConfirmed(self, path: str):
+        """Sync a folder from this computer (it appears under Computers on Drive)."""
+        self._action("folders", ["folders", "add", path, "--yes"], then=self.syncNow)
+
+    @Slot(str, bool, str)
+    def setExcludes(self, folder_id: str, defaults: bool, custom_text: str):
+        patterns = [line.strip() for line in custom_text.splitlines() if line.strip()]
+        self._action("excludes", ["folders", "excludes", folder_id, "--defaults", "on" if defaults else "off", "--set", *patterns])
 
     @Slot(str)
     def removeFolder(self, folder_id: str):

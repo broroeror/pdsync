@@ -26,14 +26,22 @@ ColumnLayout {
                 font.bold: true
                 color: stateColors[backend.state]
             }
-            Label { text: backend.lastRunText; opacity: 0.85 }
-            Label { text: backend.nextRunText; opacity: 0.65 }
+            Label {
+                text: backend.running && backend.progressText ? backend.progressText : backend.lastRunText
+                opacity: 0.85
+                elide: Text.ElideMiddle
+                maximumLineCount: 2
+                Layout.fillWidth: true
+            }
+            Label { visible: !backend.running; text: backend.nextRunText; opacity: 0.65 }
         }
         Item { Layout.fillWidth: true }
         Button {
-            text: backend.state === "syncing" ? "Syncing…" : "Sync now"
-            enabled: backend.state !== "syncing"
-            onClicked: backend.syncNow()
+            text: backend.running ? (backend.busyAction === "stop" ? "Stopping…" : "Stop") : "Sync now"
+            enabled: backend.busyAction !== "stop" && backend.state !== "login"
+            ToolTip.visible: hovered && backend.running
+            ToolTip.text: "Stops safely after the current step; the next sync carries on from there"
+            onClicked: backend.running ? backend.stopSync() : backend.syncNow()
         }
     }
 

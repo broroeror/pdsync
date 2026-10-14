@@ -34,6 +34,33 @@ ApplicationWindow {
         sourceComponent: window.needsLogin ? loginPage : window.needsSetup ? setupPage : tabbed
     }
 
+    // Shown after a folder is measured, before it is added.
+    Dialog {
+        id: confirmAdd
+        property string folderPath
+        property string summary
+        title: "Sync this folder?"
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: Math.min(window.width - 40, 520)
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        Label {
+            width: parent.width
+            text: confirmAdd.summary + "\n\nIt appears on Drive under Computers → " + backend.computerName
+                + ". Files upload on the next sync, if uploading new files is switched on in Settings."
+            wrapMode: Text.WordWrap
+        }
+        onAccepted: backend.addFolderConfirmed(folderPath)
+    }
+    Connections {
+        target: backend
+        function onFolderMeasured(folderPath, summary) {
+            confirmAdd.folderPath = folderPath
+            confirmAdd.summary = summary
+            confirmAdd.open()
+        }
+    }
+
     Component { id: loginPage; LoginPage {} }
     Component { id: setupPage; SetupPage {} }
     Component {
