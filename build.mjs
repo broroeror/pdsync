@@ -1,10 +1,12 @@
 // Bundles the engine into dist/pdsync.mjs (no tsx or preload needed at runtime).
 import { build } from 'esbuild';
-import { readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 
 const { version } = JSON.parse(readFileSync('package.json', 'utf8'));
 
-await build({
+const result = await build({
+    metafile: true,
     entryPoints: ['src/main.ts'],
     outfile: 'dist/pdsync.mjs',
     bundle: true,
@@ -30,4 +32,20 @@ await build({
     ],
     logLevel: 'warning',
 });
-console.log('built dist/pdsync.mjs');
+
+// Full license text of every bundled package (MIT and friends require
+// shipping it with copies of the code).
+const packageDirs = new Set();
+for (const input of Object.keys(result.metafile.inputs)) {
+    const match = input.match(/^(.*node_modules\/(?:@[^/]+\/)?[^/]+)\//);
+    if (match) packageDirs.add(match[1]);
+}
+const sections = [];
+for (const dir of [...packageDirs].sort()) {
+    const pkg = JSON.parse(readFileSync(path.join(dir, 'package.json'), 'utf8'));
+    const file = readdirSync(dir).find((f) => /^(licen[cs]e|copying)(\.|$)/i.test(f));
+    const text = file ? readFileSync(path.join(dir, file), 'utf8').trim() : `License: ${pkg.license ?? 'unknown'} (no license file shipped)`;
+    sections.push(`${pkg.name}@${pkg.version} (${pkg.license ?? 'unknown'})\n${'-'.repeat(60)}\n${text}`);
+}
+writeFileSync('dist/THIRD-PARTY-LICENSES.txt', sections.join('\n\n\n') + '\n');
+console.log(`built dist/pdsync.mjs (${packageDirs.size} bundled packages, licenses in dist/THIRD-PARTY-LICENSES.txt)`);

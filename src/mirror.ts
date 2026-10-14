@@ -470,7 +470,10 @@ export class Mirror {
     private async asideName(target: string) {
         const ext = path.extname(target);
         const stem = target.slice(0, target.length - ext.length);
-        const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ').replace(':', '.');
+        // Local time, e.g. 2026-10-13 21.05 (no colons: awkward in file names).
+        const now = new Date();
+        const pad = (n: number) => String(n).padStart(2, '0');
+        const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}.${pad(now.getMinutes())}`;
         for (let i = 1; ; i++) {
             const candidate = `${stem} (local copy ${stamp}${i > 1 ? ` ${i}` : ''})${ext}`;
             if (!(await statOrNull(candidate))) return candidate;

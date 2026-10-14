@@ -29,6 +29,7 @@ package() {
   cd "$pkgname"
   install -Dm644 dist/pdsync.mjs "$pkgdir/usr/lib/pdsync/pdsync.mjs"
   install -Dm644 dist/pdsync.mjs.LEGAL.txt "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-NOTICES.txt"
+  install -Dm644 dist/THIRD-PARTY-LICENSES.txt "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-LICENSES.txt"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 
   # Desktop app (Python package in a private directory).
