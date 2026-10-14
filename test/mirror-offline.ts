@@ -250,5 +250,20 @@ plan = await planUploads(db, root);
 assert.ok(!plan.items.some((i) => i.action === 'upload' && i.rel === 'k-old.txt'));
 console.log('✓ a copy left behind by a rename clash is not uploaded');
 
+// 15. A clash ends when the local file moves away: the Drive file then arrives,
+// even if "keep mine" was chosen earlier.
+await fs.writeFile(path.join(root, 'spot.txt'), 'my own file');
+drive.add({ uid: 'm', parentUid: 'root', name: 'spot.txt', type: 'file', rev: 'm1', content: 'Drive spot' });
+await run();
+assert.ok(reviewRows().some((r) => r.uid === 'm'));
+await new Mirror(drive.client(), db, root).resolve('m', 'keep-local');
+await fs.mkdir(path.join(root, 'Elsewhere'), { recursive: true });
+await fs.rename(path.join(root, 'spot.txt'), path.join(root, 'Elsewhere/spot.txt'));
+m = await run();
+assert.equal(await read('spot.txt'), 'Drive spot');
+assert.equal(await read('Elsewhere/spot.txt'), 'my own file');
+assert.ok(!reviewRows().some((r) => r.uid === 'm'));
+console.log('✓ moving the local file away ends the clash and fetches the Drive file');
+
 await fs.rm(scratch, { recursive: true, force: true });
 console.log('\nall mirror checks passed');

@@ -176,6 +176,7 @@ export class Mirror {
                 setMeta(this.db, 'scope', scope);
                 setMeta(this.db, 'event_id', latest);
             }
+            await this.recheckReview();
             return;
         }
 
@@ -201,6 +202,7 @@ export class Mirror {
         }
 
         if (this.needsRescan && !this.failures) await this.fullWalk(rootNode);
+        await this.recheckReview();
     }
 
     private async latestEventId(scope: string) {
@@ -493,6 +495,26 @@ export class Mirror {
                 ? 'changed on Drive, but the local copy was edited; not overwriting'
                 : 'a local file with this name already exists (not made by sync); not overwriting',
         );
+    }
+
+    /**
+     * A review item whose local file has gone (moved away or deleted) is no
+     * longer a clash: drop it, and fetch the Drive file into the now-free spot
+     * when the clash was with a file sync never owned. (A deleted *edited*
+     * copy is left to the normal rules.) Includes "keep mine" items.
+     */
+    private async recheckReview() {
+        const items = this.db.prepare('SELECT uid, rel_path, reason FROM review').all() as {
+            uid: string;
+            rel_path: string;
+            reason: string;
+        }[];
+        for (const item of items) {
+            if (await statOrNull(this.abs(item.rel_path))) continue;
+            this.clearReview(item.uid);
+            this.record('resolved', item.rel_path, 'the local file moved away, so there is no clash any more');
+            if (item.reason === 'local-exists') await this.syncByUid(item.uid);
+        }
     }
 
     /** Fill in Drive-side details for review items recorded before they were stored. */
