@@ -147,9 +147,9 @@ export function serviceInfo(): ServiceInfo {
     } catch {
         // is-active exits non-zero when inactive.
     }
-    const intervalMinutes = PACKAGED
-        ? (intervalIn(DROP_IN) ?? intervalIn(PACKAGED_TIMER))
-        : intervalIn(path.join(UNIT_DIR, `${UNIT}.timer`));
+    // Most specific first: per-user drop-in, a from-source unit, the packaged unit.
+    const intervalMinutes =
+        intervalIn(DROP_IN) ?? intervalIn(path.join(UNIT_DIR, `${UNIT}.timer`)) ?? intervalIn(PACKAGED_TIMER);
     return { enabled, intervalMinutes, nextRunMs: enabled ? nextRunMs() : null };
 }
 
@@ -159,7 +159,7 @@ export function serviceStatus() {
         console.log('Not running automatically. Set it up with: npm run pdsync -- service install');
         return;
     }
-    console.log(`Automatic mirror: on, every ${info.intervalMinutes ?? '?'} minutes`);
+    console.log(`Automatic mirror: on${info.intervalMinutes ? `, every ${info.intervalMinutes} minutes` : ''}`);
     console.log(`  Next run:   ${info.nextRunMs ? new Date(info.nextRunMs).toLocaleString() : 'n/a'}`);
     console.log(`  Log:        journalctl --user -u ${UNIT}`);
 }

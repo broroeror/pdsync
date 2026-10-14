@@ -149,7 +149,7 @@ async function main(command: string | undefined, args: string[]) {
                 );
             }
             if (s.reviewCount) console.log(`To review:   ${s.reviewCount} skipped file(s) (see: review)`);
-            console.log(`Automatic:   ${s.service.enabled ? `every ${s.service.intervalMinutes} min` : 'off'}`);
+            console.log(`Automatic:   ${s.service.enabled ? (s.service.intervalMinutes ? `every ${s.service.intervalMinutes} min` : 'on') : 'off'}`);
             return;
         }
         case 'activity': {
