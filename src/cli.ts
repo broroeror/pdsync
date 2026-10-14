@@ -89,6 +89,7 @@ async function runMirror(db: DatabaseSync, given: string | undefined, full: bool
     notifyChanged();
 
     const parts = [`${mirror.downloaded} downloaded`];
+    if (mirror.trashed) parts.push(`${mirror.trashed} moved to trash (deleted on Drive)`);
     if (mirror.skipped) parts.push(`${mirror.skipped} skipped (see: review)`);
     if (mirror.failures) parts.push(`${mirror.failures} failed; they will be retried next run`);
     console.log(`\nMirror at ${folder}: ${parts.join(', ')}.`);

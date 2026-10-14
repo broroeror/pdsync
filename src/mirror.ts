@@ -157,7 +157,11 @@ export class Mirror {
     private rootUid = '';
     private needsRescan = false;
     downloaded = 0;
+    trashed = 0;
     skipped = 0;
+    // Disk identity -> path of everything in the mirror folder, built on first
+    // use per run (to explain what happened to copies renamed locally).
+    private localByIno?: Map<number, string>;
     failures = 0;
 
     constructor(
@@ -503,7 +507,10 @@ export class Mirror {
 
         if (row.type === 'folder' && (await this.onlyUneditedSynced(row.rel_path, affected))) {
             const result = await moveToTrash(this.abs(row.rel_path), row.rel_path, target);
-            if (result.ok) this.record('removed', label, `deleted on Drive; moved to ${result.where}`);
+            if (result.ok) {
+                this.trashed += affected.filter((r) => r.type !== 'folder').length;
+                this.record('removed', label, `deleted on Drive; moved to ${result.where}`);
+            }
             else {
                 this.leaveBehind(affected, 'removed-on-drive');
                 this.warn(`${label}: deleted on Drive, but ${result.why}; kept for now, will retry`);
@@ -516,15 +523,28 @@ export class Mirror {
         for (const r of affected) {
             if (r.type === 'folder') continue;
             const stat = await statOrNull(this.abs(r.rel_path));
-            if (!stat) continue;
+            if (!stat) {
+                // Nothing to move, but say why, so the deletion isn't invisible.
+                const renamed = r.local_ino != null ? (await this.localInoIndex()).get(r.local_ino) : undefined;
+                this.record(
+                    'removed',
+                    r.rel_path,
+                    renamed
+                        ? `deleted on Drive; you had renamed your copy here to "${renamed}", so it was kept`
+                        : 'deleted on Drive; your copy here was already gone',
+                );
+                continue;
+            }
             if (!this.matches(r, stat)) {
                 kept++;
                 this.warn(`${r.rel_path}: deleted on Drive, but you changed it here, so your copy was kept`);
                 continue;
             }
             const result = await moveToTrash(this.abs(r.rel_path), r.rel_path, target);
-            if (result.ok) this.record('removed', r.rel_path, `deleted on Drive; moved to ${result.where}`);
-            else {
+            if (result.ok) {
+                this.trashed++;
+                this.record('removed', r.rel_path, `deleted on Drive; moved to ${result.where}`);
+            } else {
                 this.leaveBehind([r], 'removed-on-drive');
                 this.warn(`${r.rel_path}: deleted on Drive, but ${result.why}; kept for now, will retry`);
             }
@@ -533,6 +553,25 @@ export class Mirror {
             this.record('removed', label, `deleted on Drive; the folder stays because it holds your own files${kept ? ' or changes' : ''}`);
         }
         forget();
+    }
+
+    private async localInoIndex() {
+        if (!this.localByIno) {
+            const index = new Map<number, string>();
+            this.localByIno = index;
+            const walk = async (rel: string) => {
+                for (const d of await fs.readdir(this.abs(rel), { withFileTypes: true }).catch(() => [])) {
+                    const childRel = rel ? `${rel}/${d.name}` : d.name;
+                    if (d.isDirectory()) await walk(childRel);
+                    else if (d.isFile()) {
+                        const st = await statOrNull(this.abs(childRel));
+                        if (st) index.set(st.ino, childRel);
+                    }
+                }
+            };
+            await walk('');
+        }
+        return this.localByIno;
     }
 
     /** True if everything inside the folder is a synced, unedited item. */
@@ -587,6 +626,7 @@ export class Mirror {
             const result = await moveToTrash(this.abs(l.rel_path), l.rel_path, target);
             if (result.ok) {
                 drop.run(l.rel_path);
+                this.trashed++;
                 this.record('removed', l.rel_path, `deleted on Drive; moved to ${result.where}`);
             }
         }

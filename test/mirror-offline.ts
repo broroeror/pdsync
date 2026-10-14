@@ -275,6 +275,21 @@ plan = await planUploads(db, root);
 assert.ok(plan.items.some((i) => i.action === 'upload' && i.rel === 'my-work.txt'));
 console.log('✓ a copy edited here is kept when Drive deletes it (your edit wins)');
 
+// Deletions with nothing to move still say what happened.
+drive.add({ uid: 'q1', parentUid: 'root', name: 'already-gone.png', type: 'file', rev: 'q1', content: 'Q' });
+drive.add({ uid: 'q2', parentUid: 'root', name: 'renamed-here.png', type: 'file', rev: 'q2', content: 'R' });
+await run();
+await fs.rm(path.join(root, 'already-gone.png'));
+await fs.rename(path.join(root, 'renamed-here.png'), path.join(root, 'my name for it.png'));
+drive.update('q1', { trashed: true });
+drive.update('q2', { trashed: true });
+m = await run();
+const said = (rel: string) => (db.prepare("SELECT detail FROM activity WHERE kind = 'removed' AND path = ? ORDER BY id DESC").get(rel) as any)?.detail;
+assert.match(said('already-gone.png'), /already gone/);
+assert.match(said('renamed-here.png'), /renamed your copy here to "my name for it.png"/);
+assert.equal(await read('my name for it.png'), 'R');
+console.log('✓ every Drive deletion is reported, even when there was nothing to move');
+
 // A deleted folder goes to the trash whole when it only holds synced files...
 drive.add({ uid: 'F', parentUid: 'root', name: 'Shared Stuff', type: 'folder' });
 drive.add({ uid: 'F1', parentUid: 'F', name: 'one.txt', type: 'file', rev: 'f1', content: '1' });
