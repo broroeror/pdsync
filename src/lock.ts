@@ -33,3 +33,13 @@ export function acquireLock(stateDir: string) {
     }
     throw new UserError('Could not take the mirror lock.');
 }
+
+/** PID of the run currently holding the lock, or null. */
+export function lockHolder(stateDir: string): number | null {
+    try {
+        const pid = Number(fs.readFileSync(path.join(stateDir, 'mirror.lock'), 'utf8'));
+        return pid && isAlive(pid) ? pid : null;
+    } catch {
+        return null;
+    }
+}

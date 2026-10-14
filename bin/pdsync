@@ -1,0 +1,5 @@
+#!/bin/sh
+# Development launcher: runs the engine from source. The installed package
+# ships a bundled build instead.
+here=$(dirname "$(readlink -f "$0")")
+cd "$here/.." && exec node --import tsx --import ./src/preload.ts src/cli.ts "$@"

@@ -160,5 +160,39 @@ console.log('✓ failed download cleaned up and retried');
 await assert.rejects(new Mirror(drive.client(), db, path.join(scratch, 'other')).run(), /belongs to a mirror/);
 console.log('✓ state tied to its folder');
 
+// 10. Skipped files land in the review list with the right reason.
+const reviewRows = () => db.prepare('SELECT uid, reason, dismissed FROM review ORDER BY uid').all() as any[];
+assert.deepEqual(
+    reviewRows().map((r) => [r.uid, r.reason, r.dismissed]),
+    [['b', 'local-edit', 0], ['c', 'local-exists', 0]],
+);
+console.log('✓ skipped files listed for review');
+
+// 11. "Keep mine": no more warnings for this Drive version...
+await new Mirror(drive.client(), db, root).resolve('b', 'keep-local');
+m = await run({ full: true });
+assert.equal(m.skipped, 1, 'only c should still warn');
+assert.equal(await read('b.txt'), 'MY LOCAL EDIT, longer');
+// ...but a newer Drive version asks again, still without overwriting.
+drive.update('b', { rev: 'b4', content: 'B v4' });
+m = await run();
+assert.equal(await read('b.txt'), 'MY LOCAL EDIT, longer');
+assert.deepEqual({ ...reviewRows().find((r) => r.uid === 'b') }, { uid: 'b', reason: 'local-edit', dismissed: 0 });
+console.log('✓ keep-local stays quiet until Drive changes again');
+
+// 12. "Keep both": the local file is renamed aside, the Drive version fetched.
+await new Mirror(drive.client(), db, root).resolve('c', 'keep-both');
+assert.equal(await read('c.txt'), 'C from Drive');
+const aside = (await fs.readdir(root)).find((f) => f.startsWith('c (local copy '));
+assert.ok(aside, 'local copy kept');
+assert.equal(await read(aside!), 'pre-existing local file');
+assert.equal(reviewRows().some((r) => r.uid === 'c'), false);
+console.log('✓ keep-both keeps the local file and fetches the Drive one');
+
+// 13. Every action was recorded for the activity view.
+const kinds = new Set((db.prepare('SELECT kind FROM activity').all() as any[]).map((r) => r.kind));
+for (const k of ['download', 'move', 'removed', 'skipped', 'failed', 'resolved']) assert.ok(kinds.has(k), `missing ${k}`);
+console.log('✓ activity recorded');
+
 await fs.rm(scratch, { recursive: true, force: true });
 console.log('\nall mirror checks passed');

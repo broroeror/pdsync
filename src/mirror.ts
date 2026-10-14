@@ -44,8 +44,58 @@ export function openState() {
             local_size INTEGER,
             local_mtime_ms INTEGER
         );
+        CREATE TABLE IF NOT EXISTS runs (
+            id INTEGER PRIMARY KEY,
+            started_ms INTEGER NOT NULL,
+            finished_ms INTEGER,
+            downloaded INTEGER,
+            skipped INTEGER,
+            failures INTEGER,
+            -- 'auth' = the saved login stopped working; 'other' = anything else.
+            error_kind TEXT,
+            error TEXT
+        );
+        CREATE TABLE IF NOT EXISTS activity (
+            id INTEGER PRIMARY KEY,
+            time_ms INTEGER NOT NULL,
+            kind TEXT NOT NULL,      -- download | move | removed | skipped | failed | warning | resolved
+            path TEXT NOT NULL,
+            detail TEXT
+        );
+        -- Files the mirror deliberately didn't touch, awaiting a decision.
+        CREATE TABLE IF NOT EXISTS review (
+            uid TEXT PRIMARY KEY,
+            rel_path TEXT NOT NULL,
+            reason TEXT NOT NULL,    -- local-edit | local-exists
+            revision_uid TEXT NOT NULL,
+            time_ms INTEGER NOT NULL,
+            -- 1 = "keep mine" for this Drive revision: stay quiet until Drive changes again.
+            dismissed INTEGER NOT NULL DEFAULT 0
+        );
     `);
     return db;
+}
+
+const ACTIVITY_KEEP = 1000;
+
+export function addActivity(db: DatabaseSync, kind: string, rel: string, detail?: string) {
+    db.prepare('INSERT INTO activity (time_ms, kind, path, detail) VALUES (?, ?, ?, ?)').run(Date.now(), kind, rel, detail ?? null);
+    db.prepare('DELETE FROM activity WHERE id <= (SELECT MAX(id) FROM activity) - ?').run(ACTIVITY_KEEP);
+}
+
+export function startRun(db: DatabaseSync) {
+    return Number(db.prepare('INSERT INTO runs (started_ms) VALUES (?)').run(Date.now()).lastInsertRowid);
+}
+
+export function finishRun(
+    db: DatabaseSync,
+    id: number,
+    r: { downloaded: number; skipped: number; failures: number; errorKind?: string; error?: string },
+) {
+    db.prepare(
+        'UPDATE runs SET finished_ms = ?, downloaded = ?, skipped = ?, failures = ?, error_kind = ?, error = ? WHERE id = ?',
+    ).run(Date.now(), r.downloaded, r.skipped, r.failures, r.errorKind ?? null, r.error ?? null, id);
+    db.prepare('DELETE FROM runs WHERE id <= ? - 200').run(id);
 }
 
 export function getMeta(db: DatabaseSync, key: string) {
@@ -53,7 +103,7 @@ export function getMeta(db: DatabaseSync, key: string) {
     return row?.value;
 }
 
-function setMeta(db: DatabaseSync, key: string, value: string) {
+export function setMeta(db: DatabaseSync, key: string, value: string) {
     db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(
         key,
         value,
@@ -151,7 +201,7 @@ export class Mirror {
                     if (child.type === NodeType.Folder && row) queue.push([child.uid, row.rel_path]);
                 }
             } catch (error) {
-                this.fail(`listing ${folderRel || 'My Files'}`, error);
+                this.fail(folderRel || 'My Files', 'listing', error);
             }
         }
         this.needsRescan = false;
@@ -171,7 +221,7 @@ export class Mirror {
             // null = not inside My Files (e.g. another tree on the volume).
             if (parentRel !== null) await this.syncNode(node, parentRel);
         } catch (error) {
-            this.fail(`updating ${this.getRow(uid)?.rel_path ?? uid}`, error);
+            this.fail(this.getRow(uid)?.rel_path ?? uid, 'updating', error);
         }
     }
 
@@ -215,12 +265,7 @@ export class Mirror {
 
         const existing = await statOrNull(this.abs(rel));
         if (existing && !(current && this.matches(current, existing))) {
-            this.skipped++;
-            return this.warn(
-                current
-                    ? `${rel}: changed on Drive, but the local copy was edited; not overwriting`
-                    : `${rel}: a local file with this name already exists (not made by sync); not overwriting`,
-            );
+            return this.needsReview(node.uid, rel, current ? 'local-edit' : 'local-exists', revision.uid);
         }
         await this.download(node, rel, revision.uid, revision.claimedModificationTime ?? node.modificationTime);
     }
@@ -257,12 +302,13 @@ export class Mirror {
                 local_mtime_ms: Math.trunc(stat.mtimeMs),
             });
             this.downloaded++;
-            console.log(`↓ ${rel}`);
+            this.clearReview(node.uid);
+            this.record('download', rel);
         } catch (error) {
             // Release the file handle before removing the part file.
             await stream?.abort().catch(() => {});
             await fs.rm(part, { force: true });
-            this.fail(`downloading ${rel}`, error);
+            this.fail(rel, 'downloading', error);
         }
     }
 
@@ -273,7 +319,8 @@ export class Mirror {
             await fs.mkdir(path.dirname(this.abs(rel)), { recursive: true });
             await fs.rename(this.abs(row.rel_path), this.abs(rel));
             this.db.prepare('UPDATE nodes SET rel_path = ? WHERE uid = ?').run(rel, row.uid);
-            console.log(`→ ${row.rel_path}  →  ${rel}`);
+            this.db.prepare('UPDATE review SET rel_path = ? WHERE uid = ?').run(rel, row.uid);
+            this.record('move', rel, row.rel_path);
             return { ...row, rel_path: rel };
         }
         // Can't move it cleanly: leave the old file alone and fetch a fresh copy.
@@ -289,8 +336,12 @@ export class Mirror {
             await fs.mkdir(path.dirname(this.abs(rel)), { recursive: true });
             await fs.rename(this.abs(oldRel), this.abs(rel));
             const update = this.db.prepare('UPDATE nodes SET rel_path = ? WHERE uid = ?');
-            for (const r of descendants) update.run(rel + r.rel_path.slice(oldRel.length), r.uid);
-            console.log(`→ ${oldRel}/  →  ${rel}/`);
+            const updateReview = this.db.prepare('UPDATE review SET rel_path = ? WHERE uid = ?');
+            for (const r of descendants) {
+                update.run(rel + r.rel_path.slice(oldRel.length), r.uid);
+                updateReview.run(rel + r.rel_path.slice(oldRel.length), r.uid);
+            }
+            this.record('move', rel + '/', oldRel + '/');
             return;
         }
         // Can't move it cleanly: forget its contents so a rescan re-fetches
@@ -306,11 +357,15 @@ export class Mirror {
         const forget = this.db.prepare('DELETE FROM nodes WHERE uid = ?');
         if (row.type === 'folder') {
             for (const r of this.db.prepare('SELECT uid, rel_path FROM nodes').all() as Row[]) {
-                if (isUnder(r.rel_path, row.rel_path)) forget.run(r.uid);
+                if (isUnder(r.rel_path, row.rel_path)) {
+                    forget.run(r.uid);
+                    this.clearReview(r.uid);
+                }
             }
         }
         forget.run(uid);
-        console.log(`✕ ${row.rel_path}${row.type === 'folder' ? '/' : ''}  removed on Drive, kept locally`);
+        this.clearReview(uid);
+        this.record('removed', row.rel_path + (row.type === 'folder' ? '/' : ''), 'removed on Drive, kept locally');
     }
 
     private safeName(node: NodeEntity): string | null {
@@ -352,13 +407,93 @@ export class Mirror {
             .run(r.uid, r.type, r.rel_path, r.revision_uid, r.local_size, r.local_mtime_ms);
     }
 
-    private warn(message: string) {
-        console.warn(`! ${message}`);
+    private needsReview(uid: string, rel: string, reason: 'local-edit' | 'local-exists', revisionUid: string) {
+        const known = this.db.prepare('SELECT revision_uid, dismissed FROM review WHERE uid = ?').get(uid) as
+            | { revision_uid: string; dismissed: number }
+            | undefined;
+        // "Keep mine" was chosen for this exact Drive version: stay quiet.
+        if (known?.dismissed && known.revision_uid === revisionUid) return;
+        this.db
+            .prepare(
+                `INSERT INTO review (uid, rel_path, reason, revision_uid, time_ms, dismissed) VALUES (?, ?, ?, ?, ?, 0)
+                 ON CONFLICT(uid) DO UPDATE SET rel_path = excluded.rel_path, reason = excluded.reason,
+                     revision_uid = excluded.revision_uid, time_ms = excluded.time_ms, dismissed = 0`,
+            )
+            .run(uid, rel, reason, revisionUid, Date.now());
+        this.skipped++;
+        this.record(
+            'skipped',
+            rel,
+            reason === 'local-edit'
+                ? 'changed on Drive, but the local copy was edited; not overwriting'
+                : 'a local file with this name already exists (not made by sync); not overwriting',
+        );
     }
 
-    private fail(what: string, error: unknown) {
+    private clearReview(uid: string) {
+        this.db.prepare('DELETE FROM review WHERE uid = ?').run(uid);
+    }
+
+    /**
+     * Resolve a review item. 'keep-local' stays quiet until Drive changes the
+     * file again; 'keep-both' renames the local file aside (nothing is lost)
+     * and then fetches the Drive version under the original name.
+     */
+    async resolve(uid: string, action: 'keep-local' | 'keep-both') {
+        const item = this.db.prepare('SELECT * FROM review WHERE uid = ?').get(uid) as
+            | { rel_path: string; revision_uid: string }
+            | undefined;
+        if (!item) throw new Error('That item is no longer waiting for review');
+
+        if (action === 'keep-local') {
+            this.db.prepare('UPDATE review SET dismissed = 1 WHERE uid = ?').run(uid);
+            this.record('resolved', item.rel_path, 'kept the local version');
+            return;
+        }
+
+        const target = this.abs(item.rel_path);
+        if (await statOrNull(target)) {
+            const aside = await this.asideName(target);
+            await fs.rename(target, aside);
+            this.record('resolved', item.rel_path, `local version kept as ${path.basename(aside)}`);
+        }
+        // The local file is gone from the target path, so this downloads.
+        this.db.prepare('DELETE FROM nodes WHERE uid = ?').run(uid);
+        const node = await this.client.getNode(uid);
+        const revision = node.activeRevision;
+        if (!revision) throw new Error('Drive has no finished version of this file');
+        await this.download(node, item.rel_path, revision.uid, revision.claimedModificationTime ?? node.modificationTime);
+        if (this.failures) throw new Error('Downloading the Drive version failed; your local file was kept (renamed)');
+    }
+
+    /** "name (local copy 2026-10-13 21.05).ext", unique in its folder. */
+    private async asideName(target: string) {
+        const ext = path.extname(target);
+        const stem = target.slice(0, target.length - ext.length);
+        const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ').replace(':', '.');
+        for (let i = 1; ; i++) {
+            const candidate = `${stem} (local copy ${stamp}${i > 1 ? ` ${i}` : ''})${ext}`;
+            if (!(await statOrNull(candidate))) return candidate;
+        }
+    }
+
+    private record(kind: string, rel: string, detail?: string) {
+        addActivity(this.db, kind, rel, detail);
+        const symbol = { download: '↓', move: '→', removed: '✕', skipped: '!', failed: '✗', warning: '!', resolved: '✓' }[kind] ?? '·';
+        const line = kind === 'move' ? `${symbol} ${detail}  →  ${rel}` : `${symbol} ${rel}${detail ? `: ${detail}` : ''}`;
+        (kind === 'failed' ? console.error : kind === 'skipped' || kind === 'warning' ? console.warn : console.log)(line);
+    }
+
+    private warn(message: string) {
+        // Callers pass "<path>: <what happened>" (or just a message).
+        const at = message.indexOf(': ');
+        if (at > 0) this.record('warning', message.slice(0, at), message.slice(at + 2));
+        else this.record('warning', '', message);
+    }
+
+    private fail(rel: string, action: string, error: unknown) {
         this.failures++;
-        console.error(`✗ ${what}: ${error instanceof Error ? error.message : String(error)}`);
+        this.record('failed', rel, `${action} failed: ${error instanceof Error ? error.message : String(error)}`);
         if (verbose && error instanceof Error) console.error(error.stack);
     }
 }

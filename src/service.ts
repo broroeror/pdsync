@@ -96,32 +96,41 @@ export function uninstallService() {
 
 /** Next trigger time. Our timer is interval-based (monotonic), so the wall-clock
  *  time comes from list-timers rather than the unit's realtime property. */
-function nextRun() {
+function nextRunMs(): number | null {
     try {
         const [entry] = JSON.parse(systemctl('list-timers', `${UNIT}.timer`, '--output=json', '--no-pager'));
-        return entry?.next ? new Date(entry.next / 1000).toLocaleString() : 'n/a';
+        return entry?.next ? Math.round(entry.next / 1000) : null;
     } catch {
-        return 'n/a';
+        return null;
     }
 }
 
+export type ServiceInfo = { enabled: boolean; intervalMinutes: number | null; nextRunMs: number | null };
+
+export function serviceInfo(): ServiceInfo {
+    let enabled = false;
+    try {
+        enabled = systemctl('is-active', `${UNIT}.timer`).trim() === 'active';
+    } catch {
+        // is-active exits non-zero when inactive.
+    }
+    let intervalMinutes: number | null = null;
+    try {
+        const timer = fs.readFileSync(path.join(UNIT_DIR, `${UNIT}.timer`), 'utf8');
+        intervalMinutes = Number(timer.match(/^OnUnitActiveSec=(\d+)min$/m)?.[1]) || null;
+    } catch {
+        // Not installed.
+    }
+    return { enabled, intervalMinutes, nextRunMs: enabled ? nextRunMs() : null };
+}
+
 export function serviceStatus() {
-    const show = (unit: string, props: string) => {
-        try {
-            return systemctl('show', unit, `--property=${props}`, '--timestamp=pretty');
-        } catch {
-            return '';
-        }
-    };
-    const timer = show(`${UNIT}.timer`, 'ActiveState,LastTriggerUSec');
-    if (!timer.includes('ActiveState=active')) {
+    const info = serviceInfo();
+    if (!info.enabled) {
         console.log('Not running automatically. Set it up with: npm run pdsync -- service install');
         return;
     }
-    const svc = show(`${UNIT}.service`, 'Result,ExecMainExitTimestamp');
-    const get = (text: string, key: string) => text.match(new RegExp(`^${key}=(.*)$`, 'm'))?.[1] || 'n/a';
-    console.log(`Automatic mirror: on`);
-    console.log(`  Last run:   ${get(timer, 'LastTriggerUSec')} (${get(svc, 'Result')})`);
-    console.log(`  Next run:   ${nextRun()}`);
+    console.log(`Automatic mirror: on, every ${info.intervalMinutes ?? '?'} minutes`);
+    console.log(`  Next run:   ${info.nextRunMs ? new Date(info.nextRunMs).toLocaleString() : 'n/a'}`);
     console.log(`  Log:        journalctl --user -u ${UNIT}`);
 }
