@@ -49,7 +49,7 @@ ColumnLayout {
                 spacing: 8
 
                 Label {
-                    text: card.modelData.path
+                    text: (backend.folders.length > 1 && card.modelData.folder ? `${card.modelData.folder} › ` : "") + card.modelData.path
                     font.bold: true
                     elide: Text.ElideMiddle
                     Layout.fillWidth: true
@@ -70,7 +70,7 @@ ColumnLayout {
                         missingText: card.modelData.localMissing ? "Not in the folder any more" : ""
                         newer: card.modelData.newer === "local"
                         actionText: card.modelData.localMissing ? "" : "Open"
-                        onAction: backend.openLocalFile(card.modelData.path)
+                        onAction: backend.openLocalFile(card.modelData.localRoot, card.modelData.path)
                     }
                     VersionBox {
                         title: "On Drive"

@@ -26,16 +26,76 @@ ScrollView {
         }
 
         GroupBox {
-            title: "Folder"
+            title: "Folders"
             Layout.fillWidth: true
             ColumnLayout {
                 anchors.fill: parent
+                spacing: 8
+
+                Label { text: "My Files"; font.bold: true }
                 RowLayout {
-                    Label { text: backend.folder; elide: Text.ElideMiddle; Layout.fillWidth: true }
-                    Button { text: "Change…"; enabled: !backend.busyAction; onClicked: folderDialog.open() }
+                    Layout.fillWidth: true
+                    Label {
+                        text: backend.folder ? backend.folder : "Not synced to this computer"
+                        opacity: backend.folder ? 1 : 0.6
+                        elide: Text.ElideMiddle
+                        Layout.fillWidth: true
+                    }
+                    Button {
+                        text: backend.folder ? "Change…" : "Choose folder…"
+                        enabled: !backend.busyAction
+                        onClicked: folderDialog.open()
+                    }
+                }
+
+                Label {
+                    text: `From this computer (shown on Drive under Computers → ${backend.computerName})`
+                    font.bold: true
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                    Layout.topMargin: 6
+                }
+                Repeater {
+                    model: backend.folders.filter((f) => f.kind === "computer")
+                    delegate: RowLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        ColumnLayout {
+                            spacing: 0
+                            Layout.fillWidth: true
+                            Label { text: modelData.local; elide: Text.ElideMiddle; Layout.fillWidth: true }
+                            Label {
+                                text: `↔ ${backend.computerName} › ${modelData.label}${modelData.pending ? "  (first sync pending)" : ""}`
+                                opacity: 0.65
+                                font.pointSize: 8.5
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
+                            }
+                        }
+                        Button {
+                            text: "Remove"
+                            enabled: !backend.busyAction
+                            onClicked: {
+                                confirmRemove.folderId = modelData.id
+                                confirmRemove.folderPath = modelData.local
+                                confirmRemove.open()
+                            }
+                        }
+                    }
                 }
                 Label {
-                    text: "Changing the folder starts a fresh copy there. The old folder and its files are left exactly as they are."
+                    visible: backend.folders.filter((f) => f.kind === "computer").length === 0
+                    text: "None yet."
+                    opacity: 0.6
+                }
+                Button {
+                    text: "Add folder…"
+                    enabled: !backend.busyAction
+                    onClicked: addFolderDialog.open()
+                }
+                Label {
+                    text: "Changing My Files' folder starts a fresh copy there; removing a folder stops syncing it. "
+                        + "Either way, files already there (here and on Drive) are left exactly as they are."
                     wrapMode: Text.WordWrap
                     opacity: 0.7
                     font.pointSize: 8.5
@@ -176,6 +236,26 @@ ScrollView {
             font.pointSize: 8.5
             Layout.fillWidth: true
         }
+    }
+
+    FolderDialog {
+        id: addFolderDialog
+        title: "Folder from this computer to sync"
+        onAccepted: backend.addFolder(String(selectedFolder))
+    }
+
+    Dialog {
+        id: confirmRemove
+        property string folderId
+        property string folderPath
+        title: "Stop syncing this folder?"
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        Label {
+            text: `${confirmRemove.folderPath} will stop syncing.\nIts files stay where they are, on this computer and on Drive.`
+        }
+        onAccepted: backend.removeFolder(folderId)
     }
 
     FolderDialog {

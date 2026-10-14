@@ -207,7 +207,7 @@ class Backend(QObject):
             return "login"
         if s.get("running") or self._syncing:
             return "syncing"
-        if not s.get("folder") or not s.get("firstSyncDone"):
+        if not s.get("folders"):
             return "setup"
         if last.get("error") or last.get("failures"):
             return "error"
@@ -232,7 +232,26 @@ class Backend(QObject):
 
     @Property(str, notify=changed)
     def folder(self) -> str:
+        """My Files' local folder ("" if My Files isn't synced)."""
         return self._status.get("folder") or ""
+
+    @Property("QVariantList", notify=changed)
+    def folders(self) -> list:
+        """Every synced folder: My Files and those added from this computer."""
+        return [
+            {
+                "id": f["id"],
+                "kind": f["kind"],
+                "label": f["label"],
+                "local": f["local"],
+                "pending": not f.get("firstSyncDone"),
+            }
+            for f in self._status.get("folders") or []
+        ]
+
+    @Property(str, notify=changed)
+    def computerName(self) -> str:
+        return self._status.get("computerName") or "this computer"
 
     @Property(str, notify=changed)
     def lastRunText(self) -> str:
@@ -278,6 +297,7 @@ class Backend(QObject):
             {
                 "kind": a["kind"],
                 "path": a["path"],
+                "folder": a.get("folder") or "",
                 "detail": a.get("detail") or "",
                 "when": relative_time(a["timeMs"]),
             }
@@ -306,6 +326,8 @@ class Backend(QObject):
                 {
                     "id": r["id"],
                     "path": r["path"],
+                    "folder": r.get("folder") or "",
+                    "localRoot": r.get("localRoot") or self.folder,
                     "explanation": (
                         "This file was changed on this computer, and a different version was saved to Drive. "
                         "Sync didn't replace your copy."
@@ -424,11 +446,24 @@ class Backend(QObject):
     def resolve(self, item_id: str, action: str):
         self._action("resolve", ["resolve", item_id, action])
 
-    @Slot(str)
-    def openLocalFile(self, rel_path: str):
+    @Slot(str, str)
+    def openLocalFile(self, local_root: str, rel_path: str):
         """Open the local copy of a review item in its default app."""
-        if self.folder:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(self.folder) / rel_path)))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(local_root) / rel_path)))
+
+    @Slot(str)
+    def openPath(self, local: str):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(local))
+
+    @Slot(str)
+    def addFolder(self, url_or_path: str):
+        """Sync a folder from this computer (it appears under Computers on Drive)."""
+        path = QUrl(url_or_path).toLocalFile() if url_or_path.startswith("file:") else url_or_path
+        self._action("folders", ["folders", "add", path], then=self.syncNow)
+
+    @Slot(str)
+    def removeFolder(self, folder_id: str):
+        self._action("folders", ["folders", "remove", folder_id])
 
     @Slot()
     def openFolder(self):

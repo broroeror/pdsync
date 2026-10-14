@@ -91,15 +91,24 @@ ColumnLayout {
         }
     }
 
-    RowLayout {
-        Layout.fillWidth: true
-        Label {
-            text: backend.folder
-            elide: Text.ElideMiddle
-            opacity: 0.85
+    Repeater {
+        model: backend.folders
+        delegate: RowLayout {
+            required property var modelData
             Layout.fillWidth: true
+            Label {
+                text: (modelData.kind === "myfiles" ? "My Files" : `${backend.computerName} › ${modelData.label}`)
+                    + (modelData.pending ? "  ·  first sync pending" : "")
+                font.bold: true
+            }
+            Label {
+                text: modelData.local
+                elide: Text.ElideMiddle
+                opacity: 0.7
+                Layout.fillWidth: true
+            }
+            Button { text: "Open"; flat: true; onClicked: backend.openPath(modelData.local) }
         }
-        Button { text: "Open folder"; flat: true; onClicked: backend.openFolder() }
     }
 
     Label { text: "Recent activity"; font.bold: true }
@@ -142,7 +151,8 @@ ColumnLayout {
                         spacing: 0
                         Layout.fillWidth: true
                         Label {
-                            text: modelData.kind === "move" ? `${modelData.detail}  →  ${modelData.path}` : modelData.path
+                            readonly property string where: backend.folders.length > 1 && modelData.folder ? `${modelData.folder} › ` : ""
+                            text: where + (modelData.kind === "move" ? `${modelData.detail}  →  ${modelData.path}` : modelData.path)
                             elide: Text.ElideMiddle
                             Layout.fillWidth: true
                         }
