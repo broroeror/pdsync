@@ -1,0 +1,4 @@
+#!/bin/sh
+# Development launcher for the desktop app (runs from source).
+here=$(dirname "$(readlink -f "$0")")
+cd "$here/../gui" && exec python3 -m pdsync_gui "$@"

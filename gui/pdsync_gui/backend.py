@@ -1,0 +1,421 @@
+"""Bridge between the QML UI and the pdsync engine.
+
+The app never talks to Drive itself: every action is an engine command
+(`pdsync <command> --json`), run asynchronously with QProcess. The engine
+touches `<state dir>/changed` whenever something happens, and we refresh then.
+"""
+
+import json
+import os
+import time
+from pathlib import Path
+
+from PySide6.QtCore import (
+    Property,
+    QFileSystemWatcher,
+    QObject,
+    QProcess,
+    QTimer,
+    QUrl,
+    Signal,
+    Slot,
+)
+from PySide6.QtGui import QDesktopServices
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "pdsync"
+AUTOSTART_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "autostart/pdsync-gui.desktop"
+# Refresh relative times ("3 min ago") and catch runs started by the timer.
+TICK_MS = 30_000
+
+
+def engine_command() -> list[str]:
+    """The engine to run: $PDSYNC_BIN, else the dev launcher, else `pdsync` on PATH."""
+    if env := os.environ.get("PDSYNC_BIN"):
+        return [env]
+    dev = Path(__file__).resolve().parents[2] / "bin" / "pdsync"
+    return [str(dev)] if dev.is_file() else ["pdsync"]
+
+
+def relative_time(ms: int | None, future: bool = False) -> str:
+    if not ms:
+        return ""
+    seconds = (ms / 1000 - time.time()) if future else (time.time() - ms / 1000)
+    if seconds < 60:
+        return "in under a minute" if future else "just now"
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        text = f"{minutes} min"
+    elif minutes < 48 * 60:
+        text = f"{round(minutes / 60)} h"
+    else:
+        text = f"{round(minutes / 1440)} days"
+    return f"in {text}" if future else f"{text} ago"
+
+
+class Backend(QObject):
+    changed = Signal()
+    loginChanged = Signal()
+    # For the tray: (title, message) worth a desktop notification.
+    notify = Signal(str, str)
+    showWindowRequested = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self._cmd = engine_command()
+        self._status: dict = {}
+        self._activity: list = []
+        self._review: list = []
+        self._syncing = False
+        self._busy_action = ""
+        self._login_state = "idle"  # idle | working | need-totp | need-mailboxPassword
+        self._login_error = ""
+        self._login_proc: QProcess | None = None
+        self._procs: set[QProcess] = set()
+        self._refreshing = False
+        self._last_state = None
+        self._last_review_count = 0
+
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self._watcher = QFileSystemWatcher([str(STATE_DIR)])
+        self._watch_changed_file()
+        self._watcher.directoryChanged.connect(self._on_fs_change)
+        self._watcher.fileChanged.connect(self._on_fs_change)
+
+        self._tick = QTimer(self, interval=TICK_MS)
+        self._tick.timeout.connect(self.refresh)
+        self._tick.start()
+        self.refresh()
+
+    # ---- engine plumbing -------------------------------------------------
+
+    def _run(self, args: list[str], on_done=None, stdin: str | None = None):
+        proc = QProcess(self)
+        self._procs.add(proc)
+
+        def finished(code, _status):
+            out = bytes(proc.readAllStandardOutput()).decode(errors="replace")
+            err = bytes(proc.readAllStandardError()).decode(errors="replace")
+            self._procs.discard(proc)
+            proc.deleteLater()
+            if on_done:
+                on_done(code, out, err)
+
+        proc.finished.connect(finished)
+        proc.start(self._cmd[0], self._cmd[1:] + args)
+        if stdin is not None:
+            proc.write(stdin.encode())
+            proc.closeWriteChannel()
+        return proc
+
+    def _watch_changed_file(self):
+        changed = STATE_DIR / "changed"
+        if changed.exists() and str(changed) not in self._watcher.files():
+            self._watcher.addPath(str(changed))
+
+    def _on_fs_change(self, _path):
+        # Editors and the engine replace files; re-add the watch each time.
+        self._watch_changed_file()
+        self.refresh()
+
+    @Slot()
+    def refresh(self):
+        if self._refreshing:
+            return
+        self._refreshing = True
+        pending = {"n": 3}
+
+        def done():
+            pending["n"] -= 1
+            if pending["n"] == 0:
+                self._refreshing = False
+                self.changed.emit()
+                self._maybe_notify()
+
+        def got_status(code, out, _err):
+            if code == 0:
+                try:
+                    self._status = json.loads(out)
+                except json.JSONDecodeError:
+                    pass
+            done()
+
+        def got_activity(code, out, _err):
+            if code == 0:
+                try:
+                    self._activity = json.loads(out)
+                except json.JSONDecodeError:
+                    pass
+            done()
+
+        def got_review(code, out, _err):
+            if code == 0:
+                try:
+                    self._review = json.loads(out)
+                except json.JSONDecodeError:
+                    pass
+            done()
+
+        self._run(["status", "--json"], got_status)
+        self._run(["activity", "--json", "--limit", "60"], got_activity)
+        self._run(["review", "--json"], got_review)
+
+    def _maybe_notify(self):
+        state = self.state
+        if state != self._last_state:
+            if state == "login" and self._last_state is not None:
+                self.notify.emit("Login needed", "Your saved login stopped working. Open the app to log in again.")
+            elif state == "error" and self._last_state not in (None, "error"):
+                self.notify.emit("Sync problem", self.lastError or "The last sync had failures.")
+            self._last_state = state
+        count = self._status.get("reviewCount", 0)
+        if count > self._last_review_count:
+            self.notify.emit("Files need a decision", f"{count} file(s) were skipped to protect your local changes.")
+        self._last_review_count = count
+
+    # ---- properties for QML ----------------------------------------------
+
+    @Property(str, notify=changed)
+    def state(self) -> str:
+        """login | setup | syncing | error | attention | ok"""
+        s = self._status
+        if not s:
+            return "syncing"
+        last = s.get("lastRun") or {}
+        if not s.get("username") or last.get("errorKind") == "auth":
+            return "login"
+        if s.get("running") or self._syncing:
+            return "syncing"
+        if not s.get("folder") or not s.get("firstSyncDone"):
+            return "setup"
+        if last.get("error") or last.get("failures"):
+            return "error"
+        if s.get("reviewCount"):
+            return "attention"
+        return "ok"
+
+    @Property(str, notify=changed)
+    def stateText(self) -> str:
+        return {
+            "login": "Login needed",
+            "setup": "Choose a folder to start",
+            "syncing": "Syncing…",
+            "error": "The last sync had problems",
+            "attention": "Some files need a decision",
+            "ok": "Up to date",
+        }[self.state]
+
+    @Property(str, notify=changed)
+    def username(self) -> str:
+        return self._status.get("username") or ""
+
+    @Property(str, notify=changed)
+    def folder(self) -> str:
+        return self._status.get("folder") or ""
+
+    @Property(str, notify=changed)
+    def lastRunText(self) -> str:
+        last = self._status.get("lastRun")
+        if not last:
+            return "Not synced yet"
+        when = relative_time(last.get("finishedMs"))
+        if last.get("error"):
+            return f"Last sync {when} failed"
+        parts = [f"{last.get('downloaded', 0)} downloaded"]
+        if last.get("skipped"):
+            parts.append(f"{last['skipped']} skipped")
+        if last.get("failures"):
+            parts.append(f"{last['failures']} failed")
+        return f"Last sync {when}: {', '.join(parts)}"
+
+    @Property(str, notify=changed)
+    def lastError(self) -> str:
+        return (self._status.get("lastRun") or {}).get("error") or ""
+
+    @Property(str, notify=changed)
+    def nextRunText(self) -> str:
+        service = self._status.get("service") or {}
+        if not service.get("enabled"):
+            return "Automatic sync is off"
+        return f"Next sync {relative_time(service.get('nextRunMs'), future=True)}"
+
+    @Property(bool, notify=changed)
+    def autoSync(self) -> bool:
+        return bool((self._status.get("service") or {}).get("enabled"))
+
+    @Property(int, notify=changed)
+    def intervalMinutes(self) -> int:
+        return (self._status.get("service") or {}).get("intervalMinutes") or 5
+
+    @Property(int, notify=changed)
+    def reviewCount(self) -> int:
+        return self._status.get("reviewCount", 0)
+
+    @Property("QVariantList", notify=changed)
+    def activity(self) -> list:
+        return [
+            {
+                "kind": a["kind"],
+                "path": a["path"],
+                "detail": a.get("detail") or "",
+                "when": relative_time(a["timeMs"]),
+            }
+            for a in self._activity
+        ]
+
+    @Property("QVariantList", notify=changed)
+    def reviewItems(self) -> list:
+        return [
+            {
+                "id": r["id"],
+                "path": r["path"],
+                "explanation": (
+                    "You edited this file here, and it also changed on Drive."
+                    if r["reason"] == "local-edit"
+                    else "A file with this name was already in the folder before sync created it."
+                ),
+            }
+            for r in self._review
+        ]
+
+    @Property(str, notify=changed)
+    def busyAction(self) -> str:
+        """Non-empty while a settings/review action runs (disables buttons)."""
+        return self._busy_action
+
+    @Property(str, notify=loginChanged)
+    def loginState(self) -> str:
+        return self._login_state
+
+    @Property(str, notify=loginChanged)
+    def loginError(self) -> str:
+        return self._login_error
+
+    @Property(bool, notify=changed)
+    def startAtLogin(self) -> bool:
+        return AUTOSTART_FILE.exists()
+
+    # ---- actions ---------------------------------------------------------
+
+    def _action(self, name: str, args: list[str], then=None):
+        """Run an engine command that changes things; report failures."""
+        self._busy_action = name
+        self.changed.emit()
+
+        def done(code, _out, err):
+            self._busy_action = ""
+            if code != 0:
+                self.notify.emit("Something went wrong", err.strip().splitlines()[-1] if err.strip() else name)
+            self.refresh()
+            if then and code == 0:
+                then()
+
+        self._run(args, done)
+
+    @Slot()
+    def syncNow(self):
+        if self._syncing or self._status.get("running"):
+            return
+        self._syncing = True
+        self.changed.emit()
+
+        def done(_code, _out, _err):
+            self._syncing = False
+            self.refresh()
+
+        self._run(["mirror"], done)
+
+    @Slot(str)
+    def chooseFolder(self, url_or_path: str):
+        path = QUrl(url_or_path).toLocalFile() if url_or_path.startswith("file:") else url_or_path
+        self._action("folder", ["config", "folder", path], then=self.syncNow)
+
+    @Slot(bool, int)
+    def setAutoSync(self, enabled: bool, minutes: int):
+        if enabled:
+            self._action("service", ["service", "install", str(max(1, minutes))])
+        else:
+            self._action("service", ["service", "uninstall"])
+
+    @Slot(str, str)
+    def resolve(self, item_id: str, action: str):
+        self._action("resolve", ["resolve", item_id, action])
+
+    @Slot()
+    def openFolder(self):
+        if self.folder:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.folder))
+
+    @Slot(bool)
+    def setStartAtLogin(self, enabled: bool):
+        if enabled:
+            AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
+            AUTOSTART_FILE.write_text(
+                "[Desktop Entry]\nType=Application\nName=pdsync\nExec=pdsync-gui --hidden\n"
+                "Icon=pdsync\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n"
+            )
+        else:
+            AUTOSTART_FILE.unlink(missing_ok=True)
+        self.changed.emit()
+
+    # ---- login -----------------------------------------------------------
+
+    def _set_login(self, state: str, error: str = ""):
+        self._login_state = state
+        self._login_error = error
+        self.loginChanged.emit()
+
+    @Slot(str, str)
+    def login(self, username: str, password: str):
+        if self._login_proc:
+            return
+        self._set_login("working")
+        proc = QProcess(self)
+        self._login_proc = proc
+        buffer = {"data": b""}
+
+        def on_output():
+            buffer["data"] += bytes(proc.readAllStandardOutput())
+            while b"\n" in buffer["data"]:
+                line, buffer["data"] = buffer["data"].split(b"\n", 1)
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if message.get("event") == "need":
+                    self._set_login(f"need-{message['what']}")
+                elif message.get("event") == "ok":
+                    self._set_login("idle")
+                    # Sync right away so a stale "login needed" result clears.
+                    if self.folder:
+                        QTimer.singleShot(0, self.syncNow)
+                elif message.get("event") == "error":
+                    self._set_login("idle", message.get("message", "Login failed"))
+
+        def on_finished(_code, _status):
+            on_output()
+            if self._login_state not in ("idle",):
+                self._set_login("idle", self._login_error or "Login stopped unexpectedly")
+            self._login_proc = None
+            proc.deleteLater()
+            self.refresh()
+
+        proc.readyReadStandardOutput.connect(on_output)
+        proc.finished.connect(on_finished)
+        proc.start(self._cmd[0], self._cmd[1:] + ["login", "--json"])
+        proc.write((json.dumps({"username": username.strip(), "password": password}) + "\n").encode())
+
+    @Slot(str)
+    def submitLoginValue(self, value: str):
+        """Answer a 2FA code or mailbox-password request."""
+        if self._login_proc:
+            self._set_login("working")
+            self._login_proc.write((json.dumps({"value": value.strip()}) + "\n").encode())
+
+    @Slot()
+    def cancelLogin(self):
+        if self._login_proc:
+            self._login_proc.kill()
+
+    @Slot()
+    def logout(self):
+        self._action("logout", ["logout"])
