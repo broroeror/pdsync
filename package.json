@@ -13,7 +13,7 @@
   "type": "module",
   "dependencies": {
     "@protontech/crypto": "^2.2.0",
-    "@protontech/drive-sdk": "^0.22.2"
+    "@protontech/drive-sdk": "^0.23.0"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
