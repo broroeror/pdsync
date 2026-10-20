@@ -86,6 +86,8 @@ class Backend(QObject):
     # For the tray: (title, message) worth a desktop notification.
     notify = Signal(str, str)
     showWindowRequested = Signal()
+    # A folder move worked out and ready to confirm: (folder id, from, to).
+    moveProposed = Signal(str, str, str)
     # A folder's size, measured before adding it: (path, summary text).
     folderMeasured = Signal(str, str)
 
@@ -556,6 +558,33 @@ class Backend(QObject):
     @Slot(str)
     def openPath(self, local: str):
         QDesktopServices.openUrl(QUrl.fromLocalFile(local))
+
+    @Slot(str, str)
+    def proposeMove(self, folder_id: str, picked_url: str):
+        """Work out where a folder would end up, for the confirmation dialog.
+
+        An empty picked folder becomes the folder itself; otherwise the folder
+        goes inside it under its current name.
+        """
+        picked = Path(QUrl(picked_url).toLocalFile() if picked_url.startswith("file:") else picked_url)
+        folder = next((f for f in self.folders if f["id"] == folder_id), None)
+        if not folder:
+            return
+        current = Path(folder["local"])
+        try:
+            empty = picked.is_dir() and not any(picked.iterdir())
+        except OSError:
+            empty = False
+        target = picked if empty else picked / current.name
+        self.moveProposed.emit(folder_id, str(current), str(target))
+
+    @Slot(str, str)
+    def moveFolder(self, folder_id: str, target: str):
+        if self.running:
+            self.notify.emit("Sync is running", "Stop the sync (or let it finish) before moving a folder.")
+            return
+        self._action("move", ["folders", "move", folder_id, target],
+                     then=lambda: self.notify.emit("Folder moved", f"Now syncing from {target}."))
 
     @Slot()
     def stopSync(self):

@@ -6,11 +6,13 @@
 // its records in a separate database file, so pairs never mix.
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { DeviceType, DriveEventType, type ProtonDriveClient } from '@protontech/drive-sdk';
 import { getMeta, LAYOUT_VERSION, openState, setMeta, STATE_DIR } from './mirror.ts';
+import { assertMounted, measure } from './trash.ts';
 
 export type Pair = {
     /** 'myfiles' for the original pair, otherwise a random id. */
@@ -174,4 +176,65 @@ export function startFreshForNewAccount(main: DatabaseSync) {
             'mass_delete_held', 'space_waiting', 'storage', 'progress', 'exclude', 'exclude_defaults');
     `);
     setMeta(main, 'uploads', '');
+}
+
+/**
+ * Move a synced folder to a new place (e.g. another drive) and keep syncing
+ * it: same records, nothing re-downloaded, nothing changed on Drive.
+ *
+ * `newLocal` is the folder's new full path; it must not exist yet (or be an
+ * empty folder). Across drives the files are copied, the copy is checked
+ * (bytes and file count), and only then is the original removed. With
+ * `alreadyMoved`, the person moved it themselves: the new place is checked
+ * to really hold the synced files before switching over.
+ */
+export async function relocatePair(main: DatabaseSync, pair: Pair, newLocal: string, { alreadyMoved = false } = {}) {
+    const target = path.resolve(newLocal);
+    const old = pair.local;
+    if (target === old) throw new Error('That is already where this folder is.');
+    if (target === path.parse(target).root || target === os.homedir()) throw new Error(`Refusing to use ${target} itself; pick a folder inside it.`);
+    if (overlaps(target, old)) throw new Error("The new place can't be inside the folder (or contain it).");
+    if (overlaps(target, STATE_DIR)) throw new Error("That place holds (or is inside) this app's own records.");
+    const trash = getMeta(main, 'trash');
+    if (trash && overlaps(target, trash)) throw new Error('That place overlaps the trash folder for Drive deletions.');
+    for (const p of listPairs(main)) {
+        if (p.id !== pair.id && overlaps(target, p.local)) throw new Error(`That place overlaps another synced folder (${p.local}).`);
+    }
+    await assertMounted(target);
+
+    if (alreadyMoved) {
+        // Most synced files must be at the new place (some may have changed since).
+        const files = pair.db.prepare("SELECT rel_path FROM nodes WHERE type = 'file'").all() as { rel_path: string }[];
+        const present = files.filter((f) => fs.existsSync(path.join(target, f.rel_path))).length;
+        if (files.length && present < files.length * 0.9) {
+            throw new Error(`Only ${present} of ${files.length} synced files are at ${target}; is that the right folder?`);
+        }
+    } else {
+        const existing = await fsp.readdir(target).catch(() => null);
+        if (existing && existing.length) throw new Error(`${target} already has files in it; pick a new or empty folder.`);
+        if (existing) await fsp.rmdir(target); // empty: the moved folder takes its place
+        await fsp.mkdir(path.dirname(target), { recursive: true });
+        try {
+            await fsp.rename(old, target);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error;
+            // Another drive: copy, check, then remove the original.
+            try {
+                await fsp.cp(old, target, { recursive: true, preserveTimestamps: true, errorOnExist: true, force: false, verbatimSymlinks: true });
+                const [from, to] = await Promise.all([measure(old), measure(target)]);
+                if (from.bytes !== to.bytes || from.files !== to.files) throw new Error('the copy came out incomplete');
+            } catch (copyError) {
+                await fsp.rm(target, { recursive: true, force: true }).catch(() => {});
+                throw new Error(`Couldn't copy the folder to ${target} (${(copyError as Error).message}); nothing was moved.`);
+            }
+            await fsp.rm(old, { recursive: true });
+        }
+    }
+
+    // Same records at the new place. Disk identities change across drives, so
+    // forget them (they're re-learned from the files on the next scan).
+    pair.db.exec('UPDATE nodes SET local_ino = NULL');
+    setMeta(pair.db, 'root_dir', target);
+    if (pair.kind === 'computer') main.prepare('UPDATE pairs SET local = ? WHERE id = ?').run(target, pair.id);
+    return { from: old, to: target };
 }

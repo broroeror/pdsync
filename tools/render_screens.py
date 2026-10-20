@@ -4,7 +4,7 @@
         python3 tools/render_screens.py OUT.png TAB [SCENARIO]
 
 TAB: 0 = Status, 1 = Review, 2 = Settings.
-SCENARIO: ok (default) | syncing | stopped | full | measured | loggedout | humancheck
+SCENARIO: ok (default) | syncing | stopped | full | measured | loggedout | humancheck | move
 Used to check layouts without touching a real account or the real state.
 """
 
@@ -93,5 +93,7 @@ if scenario == "measured":
         "/home/user/Documents\n\n81,206 files (5.2 GB).\n"
         "After skipping node_modules, .git, caches and similar: 31,048 files (2.1 GB).",
     ))
+if scenario == "move":
+    QTimer.singleShot(300, lambda: fake.moveProposed.emit("myfiles", "/home/user/DriveMirror", "/mnt/BigDrive/DriveMirror"))
 QTimer.singleShot(800, lambda: (win.grabWindow().save(out), app.quit()))
 app.exec()

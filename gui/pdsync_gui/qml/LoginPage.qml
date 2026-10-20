@@ -104,7 +104,8 @@ Item {
                 }
                 Label {
                     text: "A page from Proton (verify.proton.me) has opened in your browser. Complete the check there, "
-                        + "then come back and press “I've completed it”."
+                        + "then come back and press “I've completed it”. (Using a VPN makes this check much more likely; "
+                        + "turning it off for the login usually avoids it.)"
                     wrapMode: Text.WordWrap
                     Layout.fillWidth: true
                 }

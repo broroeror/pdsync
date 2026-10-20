@@ -794,6 +794,61 @@ assert.equal(budget.waitingFiles, 0);
 assert.equal((await planUploads(db, root)).items.filter((i) => i.action === 'upload' && i.rel.startsWith('Space/')).length, 0);
 console.log('✓ Drive full: only what fits is tried, "full" stops further attempts, uploads resume once there is space');
 
+// 25b. Moving folders keeps syncing them: nothing re-downloaded, uploaded or sent to Review.
+const { relocatePair } = await import('../src/pairs.ts');
+const osx = await import('node:os');
+const quietRun = async (pair: any) => {
+    const mm = new Mirror(drive.client(), pair.db, pair.local, { remoteRootUid: pair.remoteUid, trash: { kind: 'folder', dir: trashDir } });
+    await mm.run();
+    const plan = await planUploads(pair.db, pair.local);
+    return { mm, plan };
+};
+// (a) A computer folder, same drive: an instant rename.
+let docsPairNow = listPairs(db).find((p) => p.label === 'Documents')!;
+const docsMoved = path.join(scratch, 'Moved Documents');
+await relocatePair(db, docsPairNow, docsMoved);
+docsPairNow = listPairs(db).find((p) => p.label === 'Documents')!;
+assert.equal(docsPairNow.local, docsMoved);
+assert.equal(await fs.readFile(path.join(docsMoved, 'a.txt'), 'utf8'), 'A doc');
+assert.equal(await fs.stat(docs).then(() => true, () => false), false, 'old place is gone (it moved)');
+let quiet = await quietRun(docsPairNow);
+assert.equal(quiet.mm.downloaded, 0);
+assert.equal(quiet.mm.skipped, 0, 'nothing sent to Review');
+assert.deepEqual(quiet.plan.items, [], 'nothing to upload or trash');
+// (b) My Files, to another drive (scratch is in memory; ~/.cache is on disk): copy, check, remove.
+const otherDrive = await fs.mkdtemp(path.join(osx.homedir(), '.cache', 'pdsync-move-test-'));
+try {
+    const myFiles = listPairs(db).find((p) => p.kind === 'myfiles')!;
+    const before = (await fs.readdir(root)).sort();
+    const target = path.join(otherDrive, 'ProtonDrive');
+    await relocatePair(db, myFiles, target);
+    assert.deepEqual((await fs.readdir(target)).sort(), before, 'everything arrived');
+    assert.equal(await fs.stat(root).then(() => true, () => false), false, 'original removed only after the copy checked out');
+    const myFilesNow = listPairs(db).find((p) => p.kind === 'myfiles')!;
+    assert.equal(myFilesNow.local, target);
+    quiet = await quietRun(myFilesNow);
+    assert.equal(quiet.mm.downloaded, 0, 'no re-download after a cross-drive move');
+    assert.equal(quiet.mm.skipped, 0, 'no Review flood');
+    assert.ok(!quiet.plan.items.some((i) => i.action === 'upload' || i.action === 'trash' || i.action === 'move'), 'nothing re-uploaded, trashed or moved on Drive');
+    // (c) Refusals: a destination that already has files; overlapping another synced folder.
+    const busy = path.join(scratch, 'busy');
+    await fs.mkdir(busy);
+    await fs.writeFile(path.join(busy, 'x'), 'x');
+    await assert.rejects(relocatePair(db, myFilesNow, busy), /already has files/);
+    await assert.rejects(relocatePair(db, myFilesNow, path.join(docsMoved, 'inside')), /overlaps another synced folder/);
+    // (d) Moved by hand: switch over only if the files are really there.
+    const byHand = path.join(otherDrive, 'MovedByHand');
+    await assert.rejects(relocatePair(db, myFilesNow, path.join(otherDrive, 'Wrong'), { alreadyMoved: true }), /synced files are at/);
+    await fs.rename(target, byHand);
+    await relocatePair(db, myFilesNow, byHand, { alreadyMoved: true });
+    assert.equal(listPairs(db).find((p) => p.kind === 'myfiles')!.local, byHand);
+    // Move it back so the remaining tests use the original folder.
+    await relocatePair(db, listPairs(db).find((p) => p.kind === 'myfiles')!, root);
+    console.log('✓ moving folders (same drive, other drive, by hand) keeps syncing with no re-download or Review');
+} finally {
+    await fs.rm(otherDrive, { recursive: true, force: true });
+}
+
 // 26. A different account starts fresh: pairings forgotten, uploads off, files and preferences kept.
 const { startFreshForNewAccount } = await import('../src/pairs.ts');
 db.prepare("INSERT INTO meta (key, value) VALUES ('uploads', 'new,edits,moves,deletes') ON CONFLICT(key) DO UPDATE SET value = excluded.value").run();
@@ -806,7 +861,7 @@ assert.equal(getMeta(db, 'account'), undefined);
 assert.equal(getMeta(db, 'trash'), trashDir, 'preferences kept');
 assert.equal((db.prepare('SELECT COUNT(*) AS n FROM nodes').get() as any).n, 0);
 assert.equal((await fs.readdir(root)).length, filesBefore, 'local files untouched');
-assert.equal(await fs.readFile(path.join(docs, 'a.txt'), 'utf8'), 'A doc', 'computer folder files untouched');
+assert.equal(await fs.readFile(path.join(docsMoved, 'a.txt'), 'utf8'), 'A doc', 'computer folder files untouched');
 console.log('✓ a different account starts fresh: pairings forgotten, uploads off, files and preferences kept');
 
 await fs.rm(scratch, { recursive: true, force: true });

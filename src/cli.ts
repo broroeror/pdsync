@@ -11,7 +11,7 @@ import { acquireLock, lockHolder } from './lock.ts';
 import { addActivity, finishRun, getMeta, Mirror, openState, requestStop, setMeta, SpaceBudget, startRun, STATE_DIR, stopRequested, StopRequested, type UploadKind } from './mirror.ts';
 import type { Api } from './api.ts';
 import { DEFAULT_EXCLUDES, excludeSettings, makeExcluder, saveExcludeSettings } from './exclude.ts';
-import { addPair, checkNewLocal, listPairs, removePair, startFreshForNewAccount, type Pair } from './pairs.ts';
+import { addPair, checkNewLocal, listPairs, relocatePair, removePair, startFreshForNewAccount, type Pair } from './pairs.ts';
 import { planForKinds, planUploads, type Plan } from './plan.ts';
 import { ask } from './prompt.ts';
 import { installService, serviceInfo, serviceStatus, uninstallService } from './service.ts';
@@ -32,6 +32,10 @@ const USAGE = `Usage: npm run pdsync -- <command>
                       Computers on Drive)
   folders remove <dir|id>
                       Stop syncing a folder (its files stay, here and on Drive)
+  folders move <dir|id> <new path> [--already-moved]
+                      Move a synced folder (e.g. to another drive) and keep
+                      syncing it; nothing is re-downloaded. --already-moved:
+                      you moved it yourself, just switch over
   folders measure <dir>
                       How many files/bytes a folder has, before and after the
                       default exclusions (node_modules, .git, caches, ...)
@@ -52,8 +56,9 @@ const USAGE = `Usage: npm run pdsync -- <command>
   resolve <id> keep-local|keep-both
                       Decide about a skipped file (keep-both renames your local
                       file aside, then fetches the Drive version)
-  config folder <dir> Mirror My Files into a different folder from now on
-                      (the old folder and its files are left as they are)
+  config folder <dir> Start My Files fresh in a different folder (downloads
+                      everything again; the old folder is left as it is).
+                      To move the existing folder instead: folders move
   config uploads <kinds>|none
                       Which kinds of local change automatic runs upload
                       (off until you switch them on)
@@ -495,6 +500,21 @@ async function main(command: string | undefined, args: string[]) {
         case 'folders': {
             const main = openState();
             const [action, target] = positional;
+            if (action === 'move') {
+                const destination = positional[2];
+                if (!target || !destination) throw new UserError('Usage: folders move <dir|id> <new path> [--already-moved]');
+                const pair = findPair(main, target);
+                acquireLock(STATE_DIR);
+                console.log(`Moving ${pair.local} to ${path.resolve(destination)}… (sync waits until this is done)`);
+                let moved;
+                try {
+                    moved = await relocatePair(main, pair, destination, { alreadyMoved: args.includes('--already-moved') });
+                } catch (error) {
+                    throw new UserError((error as Error).message);
+                }
+                notifyChanged();
+                return console.log(`Moved. ${pair.label} now syncs from ${moved.to}; nothing was re-downloaded or changed on Drive.`);
+            }
             if (action === 'measure') {
                 if (!target) throw new UserError('Usage: folders measure <dir>');
                 const m = await measureFolder(path.resolve(target), DEFAULT_EXCLUDES);

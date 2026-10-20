@@ -31,6 +31,18 @@ export async function prepareTrashFolder(dir: string, mirrorRoot: string | undef
     if (mirrorRoot && (resolved === mirrorRoot || resolved.startsWith(mirrorRoot + '/') || mirrorRoot.startsWith(resolved + '/'))) {
         throw new Error('The trash folder must be outside the mirror folder (and not contain it).');
     }
+    await assertMounted(resolved);
+    await fs.mkdir(resolved, { recursive: true });
+    return resolved;
+}
+
+/**
+ * Refuse a path under a drive's mount point (/mnt/X, /media/X,
+ * /run/media/<user>/X) when that drive isn't mounted: the mount point is then
+ * an empty folder on the system disk, and anything put there lands on the
+ * wrong drive.
+ */
+export async function assertMounted(resolved: string) {
     const parts = resolved.split('/');
     const mountDepth = parts[1] === 'run' && parts[2] === 'media' ? 5 : parts[1] === 'mnt' || parts[1] === 'media' ? 3 : 0;
     if (mountDepth && parts.length >= mountDepth) {
@@ -40,8 +52,6 @@ export async function prepareTrashFolder(dir: string, mirrorRoot: string | undef
             throw new Error(`${mountPoint} doesn't look mounted right now; plug in / mount the drive and try again.`);
         }
     }
-    await fs.mkdir(resolved, { recursive: true });
-    return resolved;
 }
 
 /** "2026-10-14 01.05" (local time; no colons, which NTFS and others reject). */
@@ -52,7 +62,7 @@ function stamp() {
 }
 
 /** Total bytes and file count under a path, to verify a cross-drive copy. */
-async function measure(p: string): Promise<{ bytes: number; files: number }> {
+export async function measure(p: string): Promise<{ bytes: number; files: number }> {
     const stat = await fs.lstat(p);
     if (!stat.isDirectory()) return { bytes: stat.size, files: 1 };
     let bytes = 0;

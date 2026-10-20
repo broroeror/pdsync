@@ -25,7 +25,10 @@ function friendlyLoginError(error: unknown): string {
     if (error instanceof ApiError) {
         if (error.code === 8002) return 'Wrong email/username or password. (Accounts made with another email log in with that email.)';
         if (error.code === 9001) {
-            return "Proton's human-verification check wasn't completed. Try logging in again and complete the check when it opens.";
+            return (
+                "Proton's human-verification check wasn't completed. Try logging in again and complete the check when it opens. " +
+                'If you use a VPN, turning it off for the login usually avoids the check.'
+            );
         }
         if (error.code === 8100 || error.status === 429) return 'Too many attempts. Wait a few minutes and try again.';
         return `Proton refused the login: ${error.message}`;

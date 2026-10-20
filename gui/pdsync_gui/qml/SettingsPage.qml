@@ -58,7 +58,14 @@ ScrollView {
                         onClicked: excludeEditor.openFor(backend.folders.find((f) => f.kind === "myfiles"))
                     }
                     Button {
-                        text: backend.folder ? "Change…" : "Choose folder…"
+                        visible: !!backend.folder
+                        text: backend.busyAction === "move" ? "Moving…" : "Move…"
+                        enabled: !backend.busyAction
+                        onClicked: moveDialog.openFor("myfiles")
+                    }
+                    Button {
+                        visible: !backend.folder
+                        text: "Choose folder…"
                         enabled: !backend.busyAction
                         onClicked: folderDialog.open()
                     }
@@ -94,6 +101,11 @@ ScrollView {
                             onClicked: excludeEditor.openFor(modelData)
                         }
                         Button {
+                            text: "Move…"
+                            enabled: !backend.busyAction
+                            onClicked: moveDialog.openFor(modelData.id)
+                        }
+                        Button {
                             text: "Remove"
                             enabled: !backend.busyAction
                             onClicked: {
@@ -115,8 +127,8 @@ ScrollView {
                     onClicked: addFolderDialog.open()
                 }
                 Label {
-                    text: "Changing My Files' folder starts a fresh copy there; removing a folder stops syncing it. "
-                        + "Either way, files already there (here and on Drive) are left exactly as they are."
+                    text: "Moving a folder takes its files along and keeps syncing them (nothing is downloaded again). "
+                        + "Removing a folder stops syncing it; its files stay, here and on Drive."
                     wrapMode: Text.WordWrap
                     opacity: 0.7
                     font.pointSize: 8.5
@@ -326,6 +338,47 @@ ScrollView {
             }
         }
         onAccepted: backend.setExcludes(folder.id, defaultsBox.checked, customArea.text)
+    }
+
+    FolderDialog {
+        id: moveDialog
+        property string folderId
+        function openFor(id) {
+            folderId = id
+            open()
+        }
+        title: "Where should the folder go?"
+        onAccepted: backend.proposeMove(folderId, String(selectedFolder))
+    }
+
+    Dialog {
+        id: confirmMove
+        property string folderId
+        property string fromPath
+        property string toPath
+        title: "Move this folder?"
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: Math.min(page.width - 40, 520)
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        Label {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: `From:  ${confirmMove.fromPath}\nTo:      ${confirmMove.toPath}\n\n`
+                + "Its files move along and keep syncing; nothing is downloaded again or changed on Drive. "
+                + "Moving to another drive copies everything first and removes the original only once the copy is complete, "
+                + "so a large folder can take a while."
+        }
+        onAccepted: backend.moveFolder(folderId, toPath)
+    }
+    Connections {
+        target: backend
+        function onMoveProposed(folderId, fromPath, toPath) {
+            confirmMove.folderId = folderId
+            confirmMove.fromPath = fromPath
+            confirmMove.toPath = toPath
+            confirmMove.open()
+        }
     }
 
     FolderDialog {
