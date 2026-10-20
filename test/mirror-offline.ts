@@ -7,7 +7,8 @@ import path from 'node:path';
 const scratch = await fs.mkdtemp(path.join(process.env.PDSYNC_TEST_TMP || os.tmpdir(), 'pdsync-test-'));
 process.env.XDG_STATE_HOME = path.join(scratch, 'state');
 const { Mirror, openState, requestStop, resetStop } = await import('../src/mirror.ts');
-const { NodeWithSameNameExistsValidationError } = await import('@protontech/drive-sdk');
+const { NodeWithSameNameExistsValidationError, ValidationError } = await import('@protontech/drive-sdk');
+const { SpaceBudget } = await import('../src/mirror.ts');
 
 type FakeNode = { uid: string; parentUid?: string; name: string; type: 'file' | 'folder'; rev?: string; content?: string; trashed?: boolean; mediaType?: string };
 
@@ -17,6 +18,8 @@ class FakeDrive {
     failDownloads = false;
     trashCalls: string[] = [];
     devices: any[] = [];
+    quotaLeft = Infinity; // bytes Drive accepts before answering "insufficient quota"
+    uploadAttempts = 0;
     seq = 0;
 
     constructor() {
@@ -132,8 +135,11 @@ class FakeDrive {
             getFileUploader: async (parentUid: string, name: string) => ({
                 uploadFromStream: async (stream: ReadableStream<Uint8Array>) => ({
                     completion: async () => {
+                        this.uploadAttempts++;
                         this.assertFreeName(parentUid, name);
                         const content = await new Response(stream).text();
+                        if (content.length > this.quotaLeft) throw new ValidationError('Storage quota exceeded', 200001);
+                        this.quotaLeft -= content.length;
                         const uid = `new${++this.seq}`;
                         this.add({ uid, parentUid, name, type: 'file', rev: `${uid}-r1`, content });
                         return { nodeUid: uid, nodeRevisionUid: `${uid}-r1` };
@@ -750,6 +756,43 @@ await mm.applyPlan(planForKinds(db, await planUploads(db, root), NEW_AND_MOVES),
 assert.equal(mm.failures, 0);
 assert.equal((db.prepare("SELECT uid FROM nodes WHERE rel_path = 'Made Before Crash'").get() as any)?.uid, 'PRE', 'linked to the existing folder');
 console.log('✓ a folder already on Drive is linked, not duplicated or failed');
+
+// 25. Drive full: only what fits is tried; a "full" answer stops further attempts.
+await fs.mkdir(path.join(root, 'Space'), { recursive: true });
+for (const n of ['a', 'b', 'c']) await fs.writeFile(path.join(root, `Space/${n}.bin`), 'xxxx'); // 4 bytes each
+// (a) The space check: room for two of the three.
+let budget = new SpaceBudget(10);
+drive.uploadAttempts = 0;
+m = new Mirror(drive.client(), db, root);
+await m.run();
+await m.applyPlan(planForKinds(db, await planUploads(db, root), NEW), NEW, budget);
+const spaceFolder = drive.childNamed('root', 'Space')!.uid;
+const upCount = () => ['a', 'b', 'c'].filter((n) => drive.childNamed(spaceFolder, `${n}.bin`)).length;
+assert.equal(upCount(), 2);
+assert.equal(drive.uploadAttempts, 2, 'the file that does not fit is not even tried');
+assert.equal(budget.waitingFiles, 1);
+assert.equal(m.failures, 0, 'waiting for space is not a failure');
+// (b) Drive answers "full" unexpectedly (another device used the space).
+for (const n of ['d', 'e', 'f']) await fs.writeFile(path.join(root, `Space/${n}.bin`), 'yyyy');
+drive.quotaLeft = 5;
+drive.uploadAttempts = 0;
+budget = new SpaceBudget(Infinity);
+m = new Mirror(drive.client(), db, root);
+await m.run();
+await m.applyPlan(planForKinds(db, await planUploads(db, root), NEW), NEW, budget);
+assert.equal(drive.uploadAttempts, 2, 'one success, one "full", then no more attempts');
+assert.equal(budget.full, true);
+assert.equal(budget.waitingFiles, 3, 'the first file still fits; the one Drive refused and the rest after it wait');
+assert.equal(m.failures, 0);
+drive.quotaLeft = Infinity;
+// Space freed: everything goes up on the next run.
+budget = new SpaceBudget(Infinity);
+m = new Mirror(drive.client(), db, root);
+await m.run();
+await m.applyPlan(planForKinds(db, await planUploads(db, root), NEW), NEW, budget);
+assert.equal(budget.waitingFiles, 0);
+assert.equal((await planUploads(db, root)).items.filter((i) => i.action === 'upload' && i.rel.startsWith('Space/')).length, 0);
+console.log('✓ Drive full: only what fits is tried, "full" stops further attempts, uploads resume once there is space');
 
 await fs.rm(scratch, { recursive: true, force: true });
 console.log('\nall mirror checks passed');

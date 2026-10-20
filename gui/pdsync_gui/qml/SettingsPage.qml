@@ -16,7 +16,17 @@ ScrollView {
             Layout.fillWidth: true
             RowLayout {
                 anchors.fill: parent
-                Label { text: "Logged in as " + backend.username; Layout.fillWidth: true; elide: Text.ElideRight }
+                ColumnLayout {
+                    spacing: 0
+                    Layout.fillWidth: true
+                    Label { text: "Logged in as " + backend.username; Layout.fillWidth: true; elide: Text.ElideRight }
+                    Label {
+                        visible: !!backend.storageText
+                        text: backend.storageText
+                        opacity: 0.7
+                        font.pointSize: 8.5
+                    }
+                }
                 Button {
                     text: "Log out"
                     enabled: !backend.busyAction

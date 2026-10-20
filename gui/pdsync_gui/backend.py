@@ -211,6 +211,10 @@ class Backend(QObject):
             elif state == "error" and self._last_state not in (None, "error"):
                 self.notify.emit("Sync problem", self.lastError or "The last sync had failures.")
             self._last_state = state
+        waiting = (self._status.get("spaceWaiting") or {}).get("files", 0)
+        if waiting and not getattr(self, "_last_space_waiting", 0):
+            self.notify.emit("Your Drive is full", f"{waiting} file(s) are waiting to upload. Free up space on Drive, or add storage.")
+        self._last_space_waiting = waiting
         held = self._status.get("massDeleteHeld", 0)
         if held and held != getattr(self, "_last_mass_held", 0):
             self.notify.emit(
@@ -240,12 +244,15 @@ class Backend(QObject):
             return "setup"
         if (last.get("error") and last.get("errorKind") != "stopped") or last.get("failures"):
             return "error"
-        if s.get("reviewCount") or s.get("massDeleteHeld"):
+        if s.get("reviewCount") or s.get("massDeleteHeld") or s.get("spaceWaiting"):
             return "attention"
         return "ok"
 
     @Property(str, notify=changed)
     def stateText(self) -> str:
+        s = self._status
+        if self.state == "attention" and s.get("spaceWaiting") and not (s.get("reviewCount") or s.get("massDeleteHeld")):
+            return "Your Drive is full"
         return {
             "login": "Login needed",
             "setup": "Choose a folder to start",
@@ -419,6 +426,27 @@ class Backend(QObject):
     def uploadKinds(self) -> list:
         """Kinds of local change automatic runs upload: new, edits, moves, deletes."""
         return list(self._status.get("uploads") or [])
+
+    @Property(str, notify=changed)
+    def spaceWaitingText(self) -> str:
+        """Non-empty while uploads wait because Drive is full."""
+        w = self._status.get("spaceWaiting")
+        if not w:
+            return ""
+        locale = QLocale.system()
+        text = f"Your Drive is full: {locale.toString(w['files'])} file(s) ({locale.formattedDataSize(w['bytes'])}) are waiting to upload."
+        st = self._status.get("storage")
+        if st:
+            text += f" ({locale.formattedDataSize(st['used'])} of {locale.formattedDataSize(st['max'])} used.)"
+        return text
+
+    @Property(str, notify=changed)
+    def storageText(self) -> str:
+        st = self._status.get("storage")
+        if not st:
+            return ""
+        locale = QLocale.system()
+        return f"Drive storage: {locale.formattedDataSize(st['used'])} of {locale.formattedDataSize(st['max'])} used"
 
     @Property(int, notify=changed)
     def massDeleteHeld(self) -> int:

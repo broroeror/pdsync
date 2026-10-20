@@ -8,7 +8,8 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { ProtonDriveClient } from '@protontech/drive-sdk';
 import { ApiError } from './api.ts';
 import { acquireLock, lockHolder } from './lock.ts';
-import { finishRun, getMeta, Mirror, openState, requestStop, setMeta, startRun, STATE_DIR, stopRequested, StopRequested, type UploadKind } from './mirror.ts';
+import { addActivity, finishRun, getMeta, Mirror, openState, requestStop, setMeta, SpaceBudget, startRun, STATE_DIR, stopRequested, StopRequested, type UploadKind } from './mirror.ts';
+import type { Api } from './api.ts';
 import { DEFAULT_EXCLUDES, excludeSettings, makeExcluder, saveExcludeSettings } from './exclude.ts';
 import { addPair, checkNewLocal, listPairs, removePair, type Pair } from './pairs.ts';
 import { planForKinds, planUploads, type Plan } from './plan.ts';
@@ -106,13 +107,50 @@ function parseKinds(words: string[]) {
 async function openSession(main: DatabaseSync) {
     let clientUid = getMeta(main, 'client_uid');
     if (!clientUid) setMeta(main, 'client_uid', (clientUid = randomUUID()));
-    const { client, username } = await openClient(clientUid);
+    const { client, api, username } = await openClient(clientUid);
     const account = getMeta(main, 'account');
     if (account && account !== username) {
         throw new UserError(`This sync belongs to ${account}. To sync ${username}, choose a new My Files folder first (config folder).`);
     }
     setMeta(main, 'account', username);
-    return client;
+    return { client, api };
+}
+
+/**
+ * Bytes left on Drive (the tighter of the Drive allowance and total storage),
+ * remembered for the app. Unknown (e.g. an older plan's fields) = unlimited;
+ * Drive's own "full" answer is the backstop then.
+ */
+async function spaceLeft(api: Api, main: DatabaseSync) {
+    try {
+        const { User } = await api.request('GET', 'core/v4/users');
+        const pairs: [number | undefined, number | undefined][] = [
+            [User.MaxDriveSpace, User.UsedDriveSpace],
+            [User.MaxSpace, User.UsedSpace],
+        ];
+        const left = pairs.filter(([max, used]) => typeof max === 'number' && typeof used === 'number' && max > 0).map(([max, used]) => max! - used!);
+        const used = User.UsedDriveSpace ?? User.UsedSpace;
+        const max = User.MaxDriveSpace ?? User.MaxSpace;
+        if (typeof used === 'number' && typeof max === 'number') setMeta(main, 'storage', JSON.stringify({ used, max, atMs: Date.now() }));
+        return left.length ? Math.max(0, Math.min(...left)) : Infinity;
+    } catch {
+        return Infinity;
+    }
+}
+
+/** One message when Drive fills up (not one per file); cleared once everything fits. */
+function reportSpace(main: DatabaseSync, budget: SpaceBudget) {
+    const before = getMeta(main, 'space_waiting');
+    if (!budget.waitingFiles) {
+        if (before) main.prepare("DELETE FROM meta WHERE key = 'space_waiting'").run();
+        return;
+    }
+    setMeta(main, 'space_waiting', JSON.stringify({ files: budget.waitingFiles, bytes: budget.waitingBytes }));
+    if (!before) {
+        const message = `Drive is full: ${budget.waitingFiles.toLocaleString()} file(s) (${humanSize(budget.waitingBytes)}) are waiting to upload`;
+        addActivity(main, 'warning', '', `${message}. Free up space on Drive (and empty its trash) or add storage; uploads resume by themselves.`);
+        console.log(`\n${message}.`);
+    }
 }
 
 function mirrorFor(
@@ -244,7 +282,7 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
     };
 
     try {
-        const client = await openSession(main);
+        const { client, api } = await openSession(main);
         const kinds = opts.kinds ?? enabledKinds(main);
         const plans: { pair: Pair; plan: Plan }[] = [];
 
@@ -282,7 +320,13 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
             printPlans(plans, 'Will');
             console.log('\nNothing of that kind to upload right now.');
         } else if (work.length && (!opts.confirm || (await opts.confirm(plans)))) {
-            for (const { pair, plan } of work) await mirrors.get(pair)!.applyPlan(plan, kinds);
+            // One space budget for every folder: only uploads that fit are tried.
+            const needsSpace = work.some(({ plan }) => plan.items.some((i) => i.action === 'upload' || i.action === 'update'));
+            const budget = new SpaceBudget(needsSpace ? await spaceLeft(api, main) : Infinity);
+            for (const { pair, plan } of work) await mirrors.get(pair)!.applyPlan(plan, kinds, budget);
+            if (kinds.has('new') || kinds.has('edits')) reportSpace(main, budget);
+        } else if (kinds.has('new') || kinds.has('edits')) {
+            reportSpace(main, new SpaceBudget(Infinity));
         }
     } catch (error) {
         endProgress();
@@ -387,6 +431,8 @@ async function status(main: DatabaseSync) {
         trash: trashTarget(main),
         uploads: [...enabledKinds(main)],
         massDeleteHeld: pairs.reduce((n, p) => n + Number(getMeta(p.db, 'mass_delete_held') ?? 0), 0),
+        storage: JSON.parse(getMeta(main, 'storage') ?? 'null'),
+        spaceWaiting: JSON.parse(getMeta(main, 'space_waiting') ?? 'null'),
         service: serviceInfo(),
     };
 }
@@ -473,7 +519,7 @@ async function main(command: string | undefined, args: string[]) {
                     const answer = await ask('Sync this folder? [y/N] ');
                     if (!/^y(es)?$/i.test(answer)) return console.log('Not added.');
                 }
-                const client = await openSession(main);
+                const { client } = await openSession(main);
                 const added = await addPair(main, client, target);
                 notifyChanged();
                 return console.log(
@@ -533,7 +579,7 @@ async function main(command: string | undefined, args: string[]) {
         case 'restore-deleted': {
             const main = openState();
             acquireLock(STATE_DIR);
-            const client = await openSession(main);
+            const { client } = await openSession(main);
             let restored = 0;
             let any = false;
             for (const pair of listPairs(main)) {
@@ -574,6 +620,8 @@ async function main(command: string | undefined, args: string[]) {
                 );
             }
             if (s.reviewCount) console.log(`To review:   ${s.reviewCount} skipped file(s) (see: review)`);
+            if (s.storage) console.log(`Drive storage: ${humanSize(s.storage.used)} of ${humanSize(s.storage.max)} used`);
+            if (s.spaceWaiting) console.log(`Drive is full: ${s.spaceWaiting.files} file(s) (${humanSize(s.spaceWaiting.bytes)}) waiting to upload`);
             console.log(`Drive deletes go to: ${describeTrash(s.trash)}`);
             console.log(`Uploads:     ${s.uploads.length ? s.uploads.join(', ') : 'off (download only)'}`);
             console.log(`Automatic:   ${s.service.enabled ? (s.service.intervalMinutes ? `every ${s.service.intervalMinutes} min` : 'on') : 'off'}`);
@@ -608,7 +656,7 @@ async function main(command: string | undefined, args: string[]) {
             if (pairs.some((p) => query(p.db).some((r) => r.drive_mtime_ms === null))) {
                 // Older items lack the Drive version's details: look them up once.
                 try {
-                    const client = await openSession(main);
+                    const { client } = await openSession(main);
                     for (const p of pairs) await mirrorFor(client, main, p).fillReviewDetails();
                 } catch {
                     // Offline or logged out: show what we have.
@@ -655,7 +703,7 @@ async function main(command: string | undefined, args: string[]) {
             const uid = colon > 0 ? id.slice(colon + 1) : id;
             acquireLock(STATE_DIR);
             try {
-                const client = await openSession(main);
+                const { client } = await openSession(main);
                 await mirrorFor(client, main, pair).resolve(uid, action, { uploadsEdits: enabledKinds(main).has('edits') });
             } finally {
                 notifyChanged();

@@ -54,6 +54,27 @@ ColumnLayout {
     }
 
     Frame {
+        visible: !!backend.spaceWaitingText
+        Layout.fillWidth: true
+        ColumnLayout {
+            anchors.fill: parent
+            Label {
+                text: backend.spaceWaitingText
+                font.bold: true
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+            }
+            Label {
+                text: "Free up space on Drive (deleted files still count until you empty Drive's trash), or add storage to your plan. "
+                    + "Uploads carry on by themselves once there's room; everything else keeps syncing meanwhile."
+                wrapMode: Text.WordWrap
+                opacity: 0.8
+                Layout.fillWidth: true
+            }
+        }
+    }
+
+    Frame {
         visible: backend.massDeleteHeld > 0
         Layout.fillWidth: true
         ColumnLayout {

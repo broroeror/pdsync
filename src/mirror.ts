@@ -201,9 +201,57 @@ function isUnder(rel: string, folderRel: string) {
     return rel === folderRel || rel.startsWith(folderRel + '/');
 }
 
+/**
+ * Space left on Drive for this run, shared by every folder pair. Uploads that
+ * don't fit are not attempted; they're counted as waiting for space. Built
+ * from the account's storage figures, and closed for the rest of the run if
+ * Drive reports it's full anyway.
+ */
+export class SpaceBudget {
+    full = false;
+    waitingFiles = 0;
+    waitingBytes = 0;
+    constructor(public remaining: number) {}
+
+    /** Reserve room for an upload; false = doesn't fit (now counted as waiting). */
+    take(bytes: number) {
+        if (!this.full && bytes <= this.remaining) {
+            this.remaining -= bytes;
+            return true;
+        }
+        this.wait(bytes);
+        return false;
+    }
+
+    /** Give back a reservation for an upload that didn't happen. */
+    giveBack(bytes: number) {
+        if (!this.full) this.remaining += bytes;
+    }
+
+    wait(bytes: number) {
+        this.waitingFiles++;
+        this.waitingBytes += bytes;
+    }
+
+    /** Drive said it's full: no more upload attempts this run. */
+    close() {
+        this.full = true;
+        this.remaining = 0;
+    }
+}
+
+// Drive's "out of space" answers (insufficient quota / space / volume / device quota).
+const QUOTA_CODES = new Set([200001, 200002, 200100, 200101]);
+export function isQuotaError(error: unknown) {
+    return QUOTA_CODES.has((error as { code?: number })?.code ?? -1);
+}
+
 function friendlyWriteError(error: unknown) {
     if (error instanceof NodeWithSameNameExistsValidationError) {
         return new Error('Drive already has an item with this name there (not synced here); rename one of them');
+    }
+    if ((error as { code?: number })?.code === 200003) {
+        return new Error("this file is larger than your Proton plan allows for a single file");
     }
     return error;
 }
@@ -603,7 +651,7 @@ export class Mirror {
      * ready (its destination folder exists on Drive) and passes repeat until
      * nothing more can happen. Anything still waiting is reported, not forced.
      */
-    async applyPlan(plan: Plan, kinds: Set<UploadKind>) {
+    async applyPlan(plan: Plan, kinds: Set<UploadKind>, budget?: SpaceBudget) {
         if (plan.blocked) return;
         const rootUid = (await this.remoteRoot()).uid;
         const parentUid = (rel: string) => {
@@ -627,9 +675,9 @@ export class Mirror {
                     continue;
                 }
                 if (item.action === 'create-folder') await this.createFolder(item.rel, parent);
-                else if (item.action === 'upload') await this.uploadNew(item.rel, parent);
+                else if (item.action === 'upload') await this.uploadNew(item.rel, parent, budget);
                 else if (item.action === 'move') await this.moveOnDrive(item, parent!);
-                else if (item.action === 'update') await this.uploadEdit(item.uid, item.rel);
+                else if (item.action === 'update') await this.uploadEdit(item.uid, item.rel, budget);
                 else if (item.action === 'trash') await this.trashOnDrive(item);
             }
             if (waiting.length === pending.length) {
@@ -648,9 +696,10 @@ export class Mirror {
      * meanwhile, send the file to Review instead of uploading over it.
      * (Drive keeps earlier versions in the file's history either way.)
      */
-    private async uploadEdit(uid: string, rel: string) {
+    private async uploadEdit(uid: string, rel: string, budget?: SpaceBudget) {
         const row = this.getRow(uid);
         const target = this.abs(rel);
+        let reserved = 0;
         try {
             const node = await this.client.getNode(uid);
             const current = node.activeRevision;
@@ -662,6 +711,9 @@ export class Mirror {
                 });
             }
             const before = await fs.stat(target);
+            // A new version takes its full size (Drive keeps the old one too).
+            if (budget && !budget.take(before.size)) return;
+            reserved = before.size;
             const uploader = await this.client.getFileRevisionUploader(
                 uid,
                 { mediaType: mediaTypeOf(rel), expectedSize: before.size, modificationTime: before.mtime },
@@ -685,8 +737,17 @@ export class Mirror {
             this.uploaded++;
             this.record('upload', rel, 'new version uploaded');
         } catch (error) {
+            if (budget && isQuotaError(error)) return this.outOfSpace(budget, rel);
+            budget?.giveBack(reserved);
             this.fail(rel, 'uploading the new version', friendlyWriteError(error));
         }
+    }
+
+    /** Drive said it's full: not a failure; the file waits, and no more uploads are tried this run. */
+    private async outOfSpace(budget: SpaceBudget, rel: string) {
+        const size = (await statOrNull(this.abs(rel)))?.size ?? 0;
+        budget.close();
+        budget.wait(size);
     }
 
     /** Deleted here: move it to Drive's trash (restorable there; never deleted outright). */
@@ -775,11 +836,14 @@ export class Mirror {
         }
     }
 
-    private async uploadNew(rel: string, parent: string | undefined) {
+    private async uploadNew(rel: string, parent: string | undefined, budget?: SpaceBudget) {
         if (!parent) return this.fail(rel, 'uploading', new Error('its folder is not on Drive'));
         const target = this.abs(rel);
+        let reserved = 0;
         try {
             const before = await fs.stat(target);
+            if (budget && !budget.take(before.size)) return;
+            reserved = before.size;
             const uploader = await this.client.getFileUploader(
                 parent,
                 path.posix.basename(rel),
@@ -806,6 +870,8 @@ export class Mirror {
             this.uploaded++;
             this.record('upload', rel);
         } catch (error) {
+            if (budget && isQuotaError(error)) return this.outOfSpace(budget, rel);
+            budget?.giveBack(reserved);
             this.fail(rel, 'uploading', friendlyWriteError(error));
         }
     }
