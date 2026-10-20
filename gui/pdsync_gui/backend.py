@@ -627,7 +627,8 @@ class Backend(QObject):
                 except json.JSONDecodeError:
                     continue
                 if message.get("event") == "need":
-                    self._set_login(f"need-{message['what']}")
+                    # A retry carries the reason (e.g. the last code was refused).
+                    self._set_login(f"need-{message['what']}", message.get("error", ""))
                 elif message.get("event") == "ok":
                     self._set_login("idle")
                     # Sync right away so a stale "login needed" result clears.

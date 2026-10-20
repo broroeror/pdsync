@@ -53,15 +53,15 @@ export async function machineLogin() {
         return JSON.parse(value);
     };
     const emit = (message: object) => process.stdout.write(JSON.stringify(message) + '\n');
-    const need = async (what: string) => {
-        emit({ event: 'need', what });
+    const need = async (what: string, error?: string) => {
+        emit({ event: 'need', what, ...(error ? { error } : {}) });
         return String((await next()).value ?? '');
     };
 
     try {
         const { username, password } = await next();
         await completeLogin(new Api(), username, password, {
-            totp: () => need('totp'),
+            totp: (retryReason) => need('totp', retryReason),
             mailboxPassword: () => need('mailboxPassword'),
         });
         emit({ event: 'ok', username });
@@ -81,7 +81,10 @@ export async function interactiveLogin() {
     const password = await ask('Password: ', { hidden: true });
     try {
         await completeLogin(api, username, password, {
-            totp: () => ask('2FA code: '),
+            totp: (retryReason) => {
+                if (retryReason) console.log(retryReason);
+                return ask('2FA code: ');
+            },
             mailboxPassword: () => ask('Mailbox password: ', { hidden: true }),
         });
     } catch (error) {
