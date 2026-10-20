@@ -44,8 +44,12 @@ ApplicationWindow {
         anchors.centerIn: Overlay.overlay
         width: Math.min(window.width - 40, 520)
         standardButtons: Dialog.Ok | Dialog.Cancel
+        // Height from its parts: with text set just before opening, the KDE style
+        // otherwise measures too early and the buttons overlap the last lines.
+        height: implicitHeaderHeight + addText.implicitHeight + implicitFooterHeight + topPadding + bottomPadding + 2 * spacing
         Label {
-            width: parent.width
+            id: addText
+            width: confirmAdd.availableWidth
             text: confirmAdd.summary + "\n\nIt appears on Drive under Computers → " + backend.computerName
                 + ". Files upload on the next sync, if uploading new files is switched on in Settings."
             wrapMode: Text.WordWrap

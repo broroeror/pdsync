@@ -173,6 +173,18 @@ await fs.rename(abs('Docs/Plan.desktop'), abs('Elsewhere/Plan.desktop'));
 assert.ok(!(await summary()).some((line) => line.includes('.desktop')));
 console.log('✓ a shortcut moved by itself is never uploaded');
 
+// 9d. A copy to another drive can shift times a hair (NTFS: .198 s -> .1979999 s):
+// that's not an edit. A real edit (seconds later) still is.
+await reset();
+await synced('moved.pdf', 'PDF');
+await synced('edited.pdf', 'PDF');
+const recorded = (db.prepare("SELECT local_mtime_ms FROM nodes WHERE rel_path = 'moved.pdf'").get() as any).local_mtime_ms;
+await fs.utimes(abs('moved.pdf'), new Date(recorded - 1), new Date(recorded - 1));
+const recorded2 = (db.prepare("SELECT local_mtime_ms FROM nodes WHERE rel_path = 'edited.pdf'").get() as any).local_mtime_ms;
+await fs.utimes(abs('edited.pdf'), new Date(recorded2 + 60_000), new Date(recorded2 + 60_000));
+assert.deepEqual(await summary(), ['update edited.pdf']);
+console.log('✓ a 1 ms time shift from a drive move is not an edit; a real later edit is');
+
 // 10. A missing or empty folder blocks everything (unmounted drive).
 await reset();
 await synced('a.txt', 'A');

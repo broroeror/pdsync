@@ -6,7 +6,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { excluderFor } from './exclude.ts';
-import type { NodeRow } from './mirror.ts';
+import { sameMtime, type NodeRow } from './mirror.ts';
 
 export type PlanItem =
     | { action: 'create-folder'; rel: string }
@@ -103,7 +103,7 @@ export async function planUploads(db: DatabaseSync, root: string, { allowMassDel
     const reviewPaths = new Set(review.map((r) => r.rel_path));
     const backfillIno = db.prepare('UPDATE nodes SET local_ino = ? WHERE uid = ?');
 
-    const matches = (row: NodeRow, e: LocalEntry) => e.size === row.local_size && e.mtimeMs === row.local_mtime_ms;
+    const matches = (row: NodeRow, e: LocalEntry) => e.size === row.local_size && sameMtime(e.mtimeMs, row.local_mtime_ms);
     // Excluded items that were synced before the exclusion: left alone (never
     // treated as deleted, which would trash them on Drive).
     const done = new Set<string>(rows.filter((r) => excluded(r.rel_path)).map((r) => r.uid)); // row uids accounted for
@@ -138,7 +138,7 @@ export async function planUploads(db: DatabaseSync, root: string, { allowMassDel
     };
     const isLeftover = (e: LocalEntry) => {
         const left = leftovers.get(e.rel);
-        return !!left && left.type === e.type && (e.type === 'folder' || (left.size === e.size && left.mtime_ms === e.mtimeMs));
+        return !!left && left.type === e.type && (e.type === 'folder' || (left.size === e.size && sameMtime(e.mtimeMs, left.mtime_ms)));
     };
 
     // 2. Missing from its place: moved/renamed (same disk identity), or deleted.

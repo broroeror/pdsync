@@ -253,6 +253,8 @@ class Backend(QObject):
     @Property(str, notify=changed)
     def stateText(self) -> str:
         s = self._status
+        if self.state == "syncing" and s.get("busyWith"):
+            return "Moving a folder…"
         if self.state == "attention" and s.get("spaceWaiting") and not (s.get("reviewCount") or s.get("massDeleteHeld")):
             return "Your Drive is full"
         return {
@@ -318,6 +320,8 @@ class Backend(QObject):
     @Property(str, notify=changed)
     def progressText(self) -> str:
         """While syncing: what has happened so far, and when the last change was."""
+        if self._status.get("busyWith"):
+            return self._status["busyWith"] + "…\nSync waits until this is done; a large folder can take a while."
         p = self._status.get("progress")
         if not p:
             return ""

@@ -181,6 +181,18 @@ export function finishRun(
     db.prepare('DELETE FROM runs WHERE id <= ? - 200').run(id);
 }
 
+/**
+ * Is a file's modification time the one we recorded? Allows 2 s of slack, as
+ * rsync's --modify-window does: copying a folder to another drive can shift
+ * times slightly (NTFS keeps 100 ns steps and rounds e.g. .198 s to
+ * .1979999 s; FAT/exFAT keep only 2 s). With exact comparison, a moved
+ * folder's untouched files looked edited.
+ */
+export const MTIME_SLACK_MS = 2000;
+export function sameMtime(actualMs: number, recordedMs: number | null | undefined) {
+    return recordedMs != null && Math.abs(Math.trunc(actualMs) - recordedMs) <= MTIME_SLACK_MS;
+}
+
 export function getMeta(db: DatabaseSync, key: string) {
     const row = db.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined;
     return row?.value;
@@ -1016,7 +1028,7 @@ export class Mirror {
                 continue;
             }
             // Edited since: it's the user's file now, not a leftover.
-            if (stat.size !== l.size || Math.trunc(stat.mtimeMs) !== l.mtime_ms) {
+            if (stat.size !== l.size || !sameMtime(stat.mtimeMs, l.mtime_ms)) {
                 drop.run(l.rel_path);
                 continue;
             }
@@ -1045,7 +1057,7 @@ export class Mirror {
     }
 
     private matches(row: Row, stat: { size: number; mtimeMs: number }) {
-        return stat.size === row.local_size && Math.trunc(stat.mtimeMs) === row.local_mtime_ms;
+        return stat.size === row.local_size && sameMtime(stat.mtimeMs, row.local_mtime_ms);
     }
 
     private abs(rel: string) {

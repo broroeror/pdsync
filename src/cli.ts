@@ -425,6 +425,7 @@ async function status(main: DatabaseSync) {
         syncAccount: getMeta(main, 'account') ?? null,
         running: lockHolder(STATE_DIR) !== null,
         progress: lockHolder(STATE_DIR) !== null ? JSON.parse(getMeta(main, 'progress') ?? 'null') : null,
+        busyWith: lockHolder(STATE_DIR) !== null ? (getMeta(main, 'busy_with') ?? null) : null,
         lastRun: lastRun
             ? {
                   finishedMs: lastRun.finished_ms,
@@ -507,10 +508,15 @@ async function main(command: string | undefined, args: string[]) {
                 acquireLock(STATE_DIR);
                 console.log(`Moving ${pair.local} to ${path.resolve(destination)}… (sync waits until this is done)`);
                 let moved;
+                // Tell the app what's holding the lock (it would otherwise look like a sync).
+                setMeta(main, 'busy_with', `Moving ${pair.label} to ${path.resolve(destination)}`);
+                notifyChanged();
                 try {
                     moved = await relocatePair(main, pair, destination, { alreadyMoved: args.includes('--already-moved') });
                 } catch (error) {
                     throw new UserError((error as Error).message);
+                } finally {
+                    main.prepare("DELETE FROM meta WHERE key = 'busy_with'").run();
                 }
                 notifyChanged();
                 return console.log(`Moved. ${pair.label} now syncs from ${moved.to}; nothing was re-downloaded or changed on Drive.`);

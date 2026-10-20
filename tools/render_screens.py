@@ -8,6 +8,7 @@ SCENARIO: ok (default) | syncing | stopped | full | measured | loggedout | human
 Used to check layouts without touching a real account or the real state.
 """
 
+import os
 import sys
 import tempfile
 import time
@@ -81,6 +82,8 @@ if not engine.rootObjects():
     sys.exit("QML failed to load")
 win = shiboken6.wrapInstance(shiboken6.getCppPointer(engine.rootObjects()[0])[0], QQuickWindow)
 win.setProperty("height", 640)
+if os.environ.get("RENDER_WIDTH"):  # e.g. 620, to check wrapping in a narrow window
+    win.setProperty("width", int(os.environ["RENDER_WIDTH"]))
 win.show()
 if scenario == "humancheck":
     fake._login_url = "https://verify.proton.me/?methods=captcha&token=EXAMPLE"

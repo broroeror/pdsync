@@ -300,8 +300,12 @@ ScrollView {
         anchors.centerIn: Overlay.overlay
         width: Math.min(page.width - 40, 520)
         standardButtons: Dialog.Save | Dialog.Cancel
+        // Height from its parts: with text set just before opening, the KDE style
+        // otherwise measures too early and the buttons overlap the last lines.
+        height: implicitHeaderHeight + excludeContent.implicitHeight + implicitFooterHeight + topPadding + bottomPadding + 2 * spacing
         ColumnLayout {
-            width: parent.width
+            id: excludeContent
+            width: excludeEditor.availableWidth
             CheckBox {
                 id: defaultsBox
                 text: "Skip things that are always regenerated"
@@ -361,8 +365,12 @@ ScrollView {
         anchors.centerIn: Overlay.overlay
         width: Math.min(page.width - 40, 520)
         standardButtons: Dialog.Ok | Dialog.Cancel
+        // Height from its parts: with text set just before opening, the KDE style
+        // otherwise measures too early and the buttons overlap the last lines.
+        height: implicitHeaderHeight + moveText.implicitHeight + implicitFooterHeight + topPadding + bottomPadding + 2 * spacing
         Label {
-            width: parent.width
+            id: moveText
+            width: confirmMove.availableWidth
             wrapMode: Text.WordWrap
             text: `From:  ${confirmMove.fromPath}\nTo:      ${confirmMove.toPath}\n\n`
                 + "Its files move along and keep syncing; nothing is downloaded again or changed on Drive. "
@@ -395,7 +403,13 @@ ScrollView {
         modal: true
         anchors.centerIn: Overlay.overlay
         standardButtons: Dialog.Ok | Dialog.Cancel
+        // Height from its parts: with text set just before opening, the KDE style
+        // otherwise measures too early and the buttons overlap the last lines.
+        height: implicitHeaderHeight + removeText.implicitHeight + implicitFooterHeight + topPadding + bottomPadding + 2 * spacing
         Label {
+            id: removeText
+            width: confirmRemove.availableWidth
+            wrapMode: Text.WordWrap
             text: `${confirmRemove.folderPath} will stop syncing.\nIts files stay where they are, on this computer and on Drive.`
         }
         onAccepted: backend.removeFolder(folderId)
@@ -419,7 +433,10 @@ ScrollView {
         modal: true
         anchors.centerIn: Overlay.overlay
         standardButtons: Dialog.Ok | Dialog.Cancel
-        Label { text: "Syncing stops until you log in again. Your files stay where they are." }
+        // Height from its parts: with text set just before opening, the KDE style
+        // otherwise measures too early and the buttons overlap the last lines.
+        height: implicitHeaderHeight + logoutText.implicitHeight + implicitFooterHeight + topPadding + bottomPadding + 2 * spacing
+        Label { id: logoutText; width: confirmLogout.availableWidth; wrapMode: Text.WordWrap; text: "Syncing stops until you log in again. Your files stay where they are." }
         onAccepted: backend.logout()
     }
 }
