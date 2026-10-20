@@ -424,6 +424,16 @@ class Backend(QObject):
         return self._login_state
 
     @Property(str, notify=loginChanged)
+    def loginUrl(self) -> str:
+        """Proton's human-verification page, while that check is pending."""
+        return getattr(self, "_login_url", "")
+
+    @Slot()
+    def openLoginUrl(self):
+        if self.loginUrl:
+            QDesktopServices.openUrl(QUrl(self.loginUrl))
+
+    @Property(str, notify=loginChanged)
     def loginError(self) -> str:
         return self._login_error
 
@@ -634,6 +644,9 @@ class Backend(QObject):
                     continue
                 if message.get("event") == "need":
                     # A retry carries the reason (e.g. the last code was refused).
+                    if message.get("url"):
+                        self._login_url = message["url"]
+                        QDesktopServices.openUrl(QUrl(self._login_url))
                     self._set_login(f"need-{message['what']}", message.get("error", ""))
                 elif message.get("event") == "fresh-start":
                     self.notify.emit(

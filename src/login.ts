@@ -11,7 +11,15 @@ const MAX_TOTP_ATTEMPTS = 3;
 // `PasswordMode` 2 = the account has a separate mailbox password for its keys.
 const TWO_PASSWORD_MODE = 2;
 
+/** Proton wants a person to complete a check (code 9001) before this login. */
+export type HumanCheck = { url: string; methods: string[]; token: string };
+
 export type Prompts = {
+    /**
+     * Show the check (open `url`) and resolve once the person says they've
+     * completed it; reject to cancel the login.
+     */
+    humanVerification?: (check: HumanCheck, attempt: number) => Promise<void>;
     /** Ask for a 2FA code; `retryReason` is set when the previous code was refused. */
     totp: (retryReason?: string) => Promise<string>;
     mailboxPassword: () => Promise<string>;
@@ -19,19 +27,61 @@ export type Prompts = {
 
 export type LoginResult = { session: Session; keyPassword: string };
 
-export async function login(api: Api, username: string, password: string, prompts: Prompts): Promise<LoginResult> {
-    const info = await api.request('POST', 'core/v4/auth/info', { Username: username, Intent: 'Proton' });
-    if (process.env.DEBUG_LOGIN) {
-        // Never print the password itself; its length is enough to spot a mangled prompt.
-        console.log(`[debug] username=${JSON.stringify(username)} passwordLength=${password.length} authVersion=${info.Version}`);
-    }
-    const srp = await getSrp(info, { username, password });
+const HUMAN_VERIFICATION = 9001;
+const MAX_HUMAN_CHECKS = 3;
 
-    const auth = await api.request('POST', 'core/v4/auth', {
-        Username: username,
-        ClientEphemeral: srp.clientEphemeral,
-        ClientProof: srp.clientProof,
-        SRPSession: info.SRPSession,
+/** The check page from Proton's answer, used only if it really is verify.proton.me. */
+export function checkUrl(webUrl: unknown, token: string, methods: string[]) {
+    try {
+        const url = new URL(String(webUrl));
+        if (url.protocol === 'https:' && url.hostname === 'verify.proton.me') return url.toString();
+    } catch {
+        // Missing or malformed: build the standard one below.
+    }
+    return `https://verify.proton.me/?methods=${encodeURIComponent(methods.join(','))}&token=${encodeURIComponent(token)}`;
+}
+
+/**
+ * Run `attempt`; if Proton answers "human verification needed", let the
+ * person complete the check, then run it again presenting the same token
+ * (which Proton accepts once the check is done). The whole exchange is
+ * retried, since a password proof can't be reused.
+ */
+export async function withHumanVerification<T>(prompts: Prompts, attempt: (headers?: Record<string, string>) => Promise<T>) {
+    let headers: Record<string, string> | undefined;
+    for (let round = 1; ; round++) {
+        try {
+            return await attempt(headers);
+        } catch (error) {
+            if (!(error instanceof ApiError) || error.code !== HUMAN_VERIFICATION || !prompts.humanVerification) throw error;
+            const details = (error.body as { Details?: Record<string, unknown> })?.Details ?? {};
+            const token = typeof details.HumanVerificationToken === 'string' ? details.HumanVerificationToken : '';
+            const methods = Array.isArray(details.HumanVerificationMethods) ? details.HumanVerificationMethods.map(String) : [];
+            if (!token || round > MAX_HUMAN_CHECKS) throw error;
+            await prompts.humanVerification({ url: checkUrl(details.WebUrl, token, methods), methods, token }, round);
+            headers = {
+                'x-pm-human-verification-token': token,
+                'x-pm-human-verification-token-type': methods.join(','),
+            };
+        }
+    }
+}
+
+export async function login(api: Api, username: string, password: string, prompts: Prompts): Promise<LoginResult> {
+    const { srp, auth } = await withHumanVerification(prompts, async (headers) => {
+        const info = await api.request('POST', 'core/v4/auth/info', { Username: username, Intent: 'Proton' }, headers);
+        if (process.env.DEBUG_LOGIN) {
+            // Never print the password itself; its length is enough to spot a mangled prompt.
+            console.log(`[debug] username=${JSON.stringify(username)} passwordLength=${password.length} authVersion=${info.Version}`);
+        }
+        const srp = await getSrp(info, { username, password });
+        const auth = await api.request(
+            'POST',
+            'core/v4/auth',
+            { Username: username, ClientEphemeral: srp.clientEphemeral, ClientProof: srp.clientProof, SRPSession: info.SRPSession },
+            headers,
+        );
+        return { srp, auth };
     });
 
     // The server proves it also knows the password verifier. If this doesn't

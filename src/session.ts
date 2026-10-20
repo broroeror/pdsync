@@ -7,6 +7,7 @@ import { clearSecret, loadSecret, saveSecret } from './keyring.ts';
 import { login, type Prompts } from './login.ts';
 import { telemetry } from './logging.ts';
 import { ask } from './prompt.ts';
+import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 
 // What the keyring holds. `keyPassword` is derived from the account password
@@ -23,7 +24,9 @@ export class AuthError extends UserError {}
 function friendlyLoginError(error: unknown): string {
     if (error instanceof ApiError) {
         if (error.code === 8002) return 'Wrong email/username or password. (Accounts made with another email log in with that email.)';
-        if (error.code === 9001) return 'Proton wants a human-verification check. Log in once at drive.proton.me in a browser, then try again.';
+        if (error.code === 9001) {
+            return "Proton's human-verification check wasn't completed. Try logging in again and complete the check when it opens.";
+        }
         if (error.code === 8100 || error.status === 429) return 'Too many attempts. Wait a few minutes and try again.';
         return `Proton refused the login: ${error.message}`;
     }
@@ -53,8 +56,8 @@ export async function machineLogin() {
         return JSON.parse(value);
     };
     const emit = (message: object) => process.stdout.write(JSON.stringify(message) + '\n');
-    const need = async (what: string, error?: string) => {
-        emit({ event: 'need', what, ...(error ? { error } : {}) });
+    const need = async (what: string, error?: string, extra: object = {}) => {
+        emit({ event: 'need', what, ...(error ? { error } : {}), ...extra });
         return String((await next()).value ?? '');
     };
 
@@ -62,6 +65,14 @@ export async function machineLogin() {
         const { username, password } = await next();
         await completeLogin(new Api(), username, password, {
             totp: (retryReason) => need('totp', retryReason),
+            humanVerification: async (check, attempt) => {
+                const answer = await need(
+                    'humanVerification',
+                    attempt > 1 ? 'Proton still wants the check. Please complete it on the page, then continue.' : undefined,
+                    { url: check.url },
+                );
+                if (answer !== 'done') throw new Error('Login cancelled');
+            },
             mailboxPassword: () => need('mailboxPassword'),
         });
         emit({ event: 'ok', username });
@@ -84,6 +95,16 @@ export async function interactiveLogin() {
             totp: (retryReason) => {
                 if (retryReason) console.log(retryReason);
                 return ask('2FA code: ');
+            },
+            humanVerification: async (check, attempt) => {
+                console.log(
+                    attempt > 1
+                        ? '\nProton still wants the check. Please complete it on the page.'
+                        : '\nProton wants to make sure a person is logging in. Complete the check on this page:',
+                );
+                console.log(`  ${check.url}`);
+                spawn('xdg-open', [check.url], { stdio: 'ignore', detached: true }).on('error', () => {}).unref();
+                await ask('Press Enter once you have completed it… ');
             },
             mailboxPassword: () => ask('Mailbox password: ', { hidden: true }),
         });

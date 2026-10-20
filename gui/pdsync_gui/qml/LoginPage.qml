@@ -6,6 +6,7 @@ Item {
     readonly property bool working: backend.loginState === "working"
     readonly property bool needsCode: backend.loginState === "need-totp"
     readonly property bool needsMailbox: backend.loginState === "need-mailboxPassword"
+    readonly property bool needsHuman: backend.loginState === "need-humanVerification"
 
     ColumnLayout {
         anchors.centerIn: parent
@@ -58,7 +59,7 @@ Item {
             // Pre-filled once (after an expired login). Not a binding: the app
             // refreshes every few seconds, and a binding would wipe what's typed.
             Component.onCompleted: text = backend.username
-            enabled: !working && !needsCode && !needsMailbox
+            enabled: !working && !needsCode && !needsMailbox && !needsHuman
             Layout.fillWidth: true
             onAccepted: password.forceActiveFocus()
         }
@@ -73,7 +74,7 @@ Item {
             id: password
             placeholderText: "Password"
             echoMode: TextInput.Password
-            enabled: !working && !needsCode && !needsMailbox
+            enabled: !working && !needsCode && !needsMailbox && !needsHuman
             Layout.fillWidth: true
             onAccepted: logIn.clicked()
         }
@@ -86,6 +87,38 @@ Item {
             Layout.fillWidth: true
             onVisibleChanged: if (visible) forceActiveFocus()
             onAccepted: logIn.clicked()
+        }
+
+        // Proton's "are you a person?" check (human verification).
+        Frame {
+            visible: needsHuman
+            Layout.fillWidth: true
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 8
+                Label {
+                    text: "Proton wants to make sure a person is logging in"
+                    font.bold: true
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                }
+                Label {
+                    text: "A page from Proton (verify.proton.me) has opened in your browser. Complete the check there, "
+                        + "then come back and press “I've completed it”."
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    Button { text: "Open the check in my browser"; onClicked: backend.openLoginUrl() }
+                    Item { Layout.fillWidth: true }
+                    Button {
+                        text: "I've completed it"
+                        highlighted: true
+                        onClicked: backend.submitLoginValue("done")
+                    }
+                }
+            }
         }
 
         Label {
@@ -107,11 +140,12 @@ Item {
             Item { Layout.fillWidth: true }
             Button {
                 text: "Cancel"
-                visible: working || needsCode || needsMailbox
+                visible: working || needsCode || needsMailbox || needsHuman
                 onClicked: backend.cancelLogin()
             }
             Button {
                 id: logIn
+                visible: !needsHuman
                 text: needsCode || needsMailbox ? "Continue" : "Log in"
                 highlighted: true
                 enabled: !working && (needsCode || needsMailbox ? extra.text.length > 0 : email.text.length > 0 && password.text.length > 0)

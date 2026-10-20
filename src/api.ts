@@ -38,9 +38,9 @@ export class Api {
     }
 
     /** JSON request against a core/drive API path, e.g. `core/v4/users`. */
-    async request<T = any>(method: string, path: string, json?: object): Promise<T> {
+    async request<T = any>(method: string, path: string, json?: object, extraHeaders?: Record<string, string>): Promise<T> {
         const send = () => {
-            const headers = new Headers({ Accept: 'application/vnd.protonmail.v1+json' });
+            const headers = new Headers({ Accept: 'application/vnd.protonmail.v1+json', ...extraHeaders });
             if (json) headers.set('Content-Type', 'application/json');
             this.sessionHeaders(headers);
             return fetch(`${API_BASE}/${path}`, {

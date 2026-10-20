@@ -4,7 +4,7 @@
         python3 tools/render_screens.py OUT.png TAB [SCENARIO]
 
 TAB: 0 = Status, 1 = Review, 2 = Settings.
-SCENARIO: ok (default) | syncing | stopped | full | measured | loggedout
+SCENARIO: ok (default) | syncing | stopped | full | measured | loggedout | humancheck
 Used to check layouts without touching a real account or the real state.
 """
 
@@ -48,7 +48,7 @@ fake._activity = [
     {"timeMs": now - 86_400_000 * 2, "kind": "download", "path": "Photos/beach.jpg", "folder": "My Files"},
 ]
 fake._status = {
-    "username": None if scenario == "loggedout" else "tester@example.com",
+    "username": None if scenario in ("loggedout", "humancheck") else "tester@example.com",
     "syncAccount": "tester@example.com",
     "folder": "/home/user/DriveMirror",
     "firstSyncDone": True,
@@ -82,6 +82,9 @@ if not engine.rootObjects():
 win = shiboken6.wrapInstance(shiboken6.getCppPointer(engine.rootObjects()[0])[0], QQuickWindow)
 win.setProperty("height", 640)
 win.show()
+if scenario == "humancheck":
+    fake._login_url = "https://verify.proton.me/?methods=captcha&token=EXAMPLE"
+    fake._set_login("need-humanVerification")
 fake.changed.emit()
 win.findChild(QObject, "tabs").setProperty("currentIndex", tab)
 if scenario == "measured":
