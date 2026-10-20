@@ -222,17 +222,32 @@ ScrollView {
                     }
                     SpinBox {
                         id: interval
+                        objectName: "intervalBox"
+                        // Follows the saved setting only while you're not
+                        // changing it (a binding would undo your edit on the
+                        // next refresh, before Apply).
+                        property bool edited: false
                         from: 1
                         to: 240
-                        value: backend.intervalMinutes
                         editable: true
                         enabled: !backend.busyAction
+                        Component.onCompleted: value = backend.intervalMinutes
+                        onValueModified: edited = true
+                        Connections {
+                            target: backend
+                            function onChanged() {
+                                if (!interval.edited) interval.value = backend.intervalMinutes
+                            }
+                        }
                     }
                     Label { text: "minutes" }
                     Button {
                         text: "Apply"
                         visible: auto.checked && interval.value !== backend.intervalMinutes
-                        onClicked: backend.setAutoSync(true, interval.value)
+                        onClicked: {
+                            interval.edited = false
+                            backend.setAutoSync(true, interval.value)
+                        }
                     }
                 }
                 Label {

@@ -42,8 +42,11 @@ Item {
 
         TextField {
             id: email
+            objectName: "emailField"
             placeholderText: "Email or username"
-            text: backend.username
+            // Pre-filled once (after an expired login). Not a binding: the app
+            // refreshes every few seconds, and a binding would wipe what's typed.
+            Component.onCompleted: text = backend.username
             enabled: !working && !needsCode && !needsMailbox
             Layout.fillWidth: true
             onAccepted: password.forceActiveFocus()
