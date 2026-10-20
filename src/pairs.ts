@@ -154,3 +154,24 @@ export function removePair(main: DatabaseSync, idOrLocal: string) {
     fs.rmSync(path.join(PAIRS_DIR, `${row.id}.db`), { force: true });
     return row.local;
 }
+
+/**
+ * Logging in as a different account: forget everything tied to the previous
+ * one (folder pairings, sync records, this PC's device), so nothing of the
+ * old account's folders gets synced into the new one. Uploads are switched
+ * off for a cautious start. Files are untouched, here and on both Drives;
+ * preferences (trash folder, interval) are kept.
+ */
+export function startFreshForNewAccount(main: DatabaseSync) {
+    ensurePairsTable(main);
+    for (const { id } of main.prepare('SELECT id FROM pairs').all() as { id: string }[]) {
+        fs.rmSync(path.join(PAIRS_DIR, `${id}.db`), { force: true });
+    }
+    main.exec(`
+        DELETE FROM pairs; DELETE FROM nodes; DELETE FROM review; DELETE FROM leftovers;
+        DELETE FROM activity; DELETE FROM runs;
+        DELETE FROM meta WHERE key IN ('root_dir', 'event_id', 'scope', 'layout', 'account', 'device_uid',
+            'mass_delete_held', 'space_waiting', 'storage', 'progress', 'exclude', 'exclude_defaults');
+    `);
+    setMeta(main, 'uploads', '');
+}

@@ -11,7 +11,7 @@ import { acquireLock, lockHolder } from './lock.ts';
 import { addActivity, finishRun, getMeta, Mirror, openState, requestStop, setMeta, SpaceBudget, startRun, STATE_DIR, stopRequested, StopRequested, type UploadKind } from './mirror.ts';
 import type { Api } from './api.ts';
 import { DEFAULT_EXCLUDES, excludeSettings, makeExcluder, saveExcludeSettings } from './exclude.ts';
-import { addPair, checkNewLocal, listPairs, removePair, type Pair } from './pairs.ts';
+import { addPair, checkNewLocal, listPairs, removePair, startFreshForNewAccount, type Pair } from './pairs.ts';
 import { planForKinds, planUploads, type Plan } from './plan.ts';
 import { ask } from './prompt.ts';
 import { installService, serviceInfo, serviceStatus, uninstallService } from './service.ts';
@@ -415,6 +415,9 @@ async function status(main: DatabaseSync) {
             excludes: excludeSettings(p.db),
         })),
         computerName: os.hostname(),
+        // The account the current sync setup belongs to (may differ from the
+        // logged-in one only while logged out).
+        syncAccount: getMeta(main, 'account') ?? null,
         running: lockHolder(STATE_DIR) !== null,
         progress: lockHolder(STATE_DIR) !== null ? JSON.parse(getMeta(main, 'progress') ?? 'null') : null,
         lastRun: lastRun
@@ -442,11 +445,27 @@ async function main(command: string | undefined, args: string[]) {
     const positional = args.filter((a) => !a.startsWith('--'));
 
     switch (command) {
-        case 'login':
-            if (json) return machineLogin().finally(() => notifyChanged());
-            await interactiveLogin();
+        case 'login': {
+            const main = openState();
+            const previous = getMeta(main, 'account');
+            if (previous && !json) {
+                console.log(
+                    `Sync is set up for ${previous}. Logging in as a different account starts fresh: folder pairings are ` +
+                        'forgotten and uploads switched off. Files stay where they are, here and on Drive.\n',
+                );
+            }
+            if (json) await machineLogin();
+            else await interactiveLogin();
+            const now = await savedUsername();
+            if (previous && now && previous.toLowerCase() !== now.toLowerCase()) {
+                acquireLock(STATE_DIR);
+                startFreshForNewAccount(main);
+                if (json) process.stdout.write(JSON.stringify({ event: 'fresh-start', previous }) + '\n');
+                else console.log(`Started fresh for ${now}: choose folders to sync (uploads are off until you switch them on).`);
+            }
             notifyChanged();
             return;
+        }
         case 'logout':
             await logout();
             notifyChanged();

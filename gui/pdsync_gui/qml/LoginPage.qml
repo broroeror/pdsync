@@ -31,6 +31,17 @@ Item {
             Layout.fillWidth: true
         }
 
+        Label {
+            visible: !!backend.syncAccount && !backend.username
+            text: `Sync is set up for ${backend.syncAccount}. Logging in as a different account starts fresh: `
+                + "folder pairings are forgotten and uploads are switched off. Files stay where they are, here and on Drive."
+            wrapMode: Text.WordWrap
+            horizontalAlignment: Text.AlignHCenter
+            font.pointSize: 8.5
+            opacity: 0.85
+            Layout.fillWidth: true
+        }
+
         // Required by Proton's guidelines wherever credentials are asked for.
         Label {
             text: "This is a third-party application not officially supported by Proton."

@@ -4,7 +4,7 @@
         python3 tools/render_screens.py OUT.png TAB [SCENARIO]
 
 TAB: 0 = Status, 1 = Review, 2 = Settings.
-SCENARIO: ok (default) | syncing | stopped | full | measured
+SCENARIO: ok (default) | syncing | stopped | full | measured | loggedout
 Used to check layouts without touching a real account or the real state.
 """
 
@@ -48,7 +48,8 @@ fake._activity = [
     {"timeMs": now - 86_400_000 * 2, "kind": "download", "path": "Photos/beach.jpg", "folder": "My Files"},
 ]
 fake._status = {
-    "username": "tester@example.com",
+    "username": None if scenario == "loggedout" else "tester@example.com",
+    "syncAccount": "tester@example.com",
     "folder": "/home/user/DriveMirror",
     "firstSyncDone": True,
     "computerName": "my-pc",

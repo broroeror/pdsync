@@ -794,5 +794,20 @@ assert.equal(budget.waitingFiles, 0);
 assert.equal((await planUploads(db, root)).items.filter((i) => i.action === 'upload' && i.rel.startsWith('Space/')).length, 0);
 console.log('✓ Drive full: only what fits is tried, "full" stops further attempts, uploads resume once there is space');
 
+// 26. A different account starts fresh: pairings forgotten, uploads off, files and preferences kept.
+const { startFreshForNewAccount } = await import('../src/pairs.ts');
+db.prepare("INSERT INTO meta (key, value) VALUES ('uploads', 'new,edits,moves,deletes') ON CONFLICT(key) DO UPDATE SET value = excluded.value").run();
+db.prepare("INSERT INTO meta (key, value) VALUES ('account', 'old@example.com') ON CONFLICT(key) DO UPDATE SET value = excluded.value").run();
+const filesBefore = (await fs.readdir(root)).length;
+startFreshForNewAccount(db);
+assert.deepEqual(listPairs(db), [], 'no folder pairings left (My Files included)');
+assert.equal(getMeta(db, 'uploads'), '', 'uploads switched off');
+assert.equal(getMeta(db, 'account'), undefined);
+assert.equal(getMeta(db, 'trash'), trashDir, 'preferences kept');
+assert.equal((db.prepare('SELECT COUNT(*) AS n FROM nodes').get() as any).n, 0);
+assert.equal((await fs.readdir(root)).length, filesBefore, 'local files untouched');
+assert.equal(await fs.readFile(path.join(docs, 'a.txt'), 'utf8'), 'A doc', 'computer folder files untouched');
+console.log('✓ a different account starts fresh: pairings forgotten, uploads off, files and preferences kept');
+
 await fs.rm(scratch, { recursive: true, force: true });
 console.log('\nall mirror checks passed');

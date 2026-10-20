@@ -288,6 +288,11 @@ class Backend(QObject):
         ]
 
     @Property(str, notify=changed)
+    def syncAccount(self) -> str:
+        """The account the sync setup belongs to ("" if none yet)."""
+        return self._status.get("syncAccount") or ""
+
+    @Property(str, notify=changed)
     def computerName(self) -> str:
         return self._status.get("computerName") or "this computer"
 
@@ -617,6 +622,7 @@ class Backend(QObject):
         proc = QProcess(self)
         self._login_proc = proc
         buffer = {"data": b""}
+        login_ok = {"value": False}
 
         def on_output():
             buffer["data"] += bytes(proc.readAllStandardOutput())
@@ -629,16 +635,24 @@ class Backend(QObject):
                 if message.get("event") == "need":
                     # A retry carries the reason (e.g. the last code was refused).
                     self._set_login(f"need-{message['what']}", message.get("error", ""))
+                elif message.get("event") == "fresh-start":
+                    self.notify.emit(
+                        "Started fresh for this account",
+                        f"Folder pairings for {message.get('previous', 'the previous account')} were forgotten (files stay). "
+                        "Choose what to sync; uploads are off until you switch them on.",
+                    )
                 elif message.get("event") == "ok":
                     self._set_login("idle")
-                    # Sync right away so a stale "login needed" result clears.
-                    if self.folder:
-                        QTimer.singleShot(0, self.syncNow)
+                    login_ok["value"] = True
                 elif message.get("event") == "error":
                     self._set_login("idle", message.get("message", "Login failed"))
 
         def on_finished(_code, _status):
             on_output()
+            # Sync right away (so a stale "login needed" clears), but only once
+            # the login process is done: it may still be starting fresh.
+            if login_ok["value"]:
+                QTimer.singleShot(500, lambda: self.folders and self.syncNow())
             if self._login_state not in ("idle",):
                 self._set_login("idle", self._login_error or "Login stopped unexpectedly")
             self._login_proc = None
