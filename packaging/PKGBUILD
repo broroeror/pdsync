@@ -9,7 +9,7 @@ pkgrel=22
 pkgdesc="Unofficial Linux mirror client for Proton Drive (third-party, not supported by Proton)"
 arch=('any')
 license=('GPL-3.0-or-later')
-depends=('nodejs>=22' 'python' 'pyside6' 'libsecret' 'systemd')
+depends=('nodejs>=22' 'python' 'pyside6' 'qt6-svg' 'libsecret' 'glib2' 'systemd')
 makedepends=('git' 'npm')
 source=("$pkgname-src::git+file://$(realpath "$startdir/..")")
 sha256sums=('SKIP')
