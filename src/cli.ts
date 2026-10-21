@@ -11,7 +11,7 @@ import { acquireLock, lockHolder } from './lock.ts';
 import { addActivity, finishRun, getMeta, Mirror, openState, requestStop, setMeta, SpaceBudget, startRun, STATE_DIR, stopRequested, StopRequested, type UploadKind } from './mirror.ts';
 import type { Api } from './api.ts';
 import { DEFAULT_EXCLUDES, excludeSettings, makeExcluder, saveExcludeSettings } from './exclude.ts';
-import { addPair, checkNewLocal, listPairs, relocatePair, removePair, startFreshForNewAccount, type Pair } from './pairs.ts';
+import { addPair, checkNewLocal, enabledKinds, folderKinds, listPairs, relocatePair, removePair, startFreshForNewAccount, UPLOAD_KINDS, type Pair } from './pairs.ts';
 import { planForKinds, planUploads, type Plan } from './plan.ts';
 import { ask } from './prompt.ts';
 import { installService, serviceInfo, serviceStatus, uninstallService } from './service.ts';
@@ -39,6 +39,9 @@ const USAGE = `Usage: npm run pdsync -- <command>
   folders measure <dir>
                       How many files/bytes a folder has, before and after the
                       default exclusions (node_modules, .git, caches, ...)
+  folders uploads <dir|id> [default | none | <kinds>...]
+                      Show or set which local changes a folder from this
+                      computer uploads (default = follow config uploads)
   folders excludes <dir|id> [--defaults on|off] [--set <pattern>...]
                       Show or change what a folder never syncs
   stop                Stop a sync in progress safely (finishes or cancels the
@@ -89,13 +92,6 @@ function checkMyFilesFolder(main: DatabaseSync, folder: string) {
             throw new UserError(`That folder overlaps one that's already synced (${p.local}).`);
         }
     }
-}
-
-const UPLOAD_KINDS: UploadKind[] = ['new', 'edits', 'moves', 'deletes'];
-
-/** Upload kinds switched on for automatic runs. */
-function enabledKinds(main: DatabaseSync) {
-    return new Set((getMeta(main, 'uploads') ?? '').split(',').filter((k): k is UploadKind => UPLOAD_KINDS.includes(k as UploadKind)));
 }
 
 function parseKinds(words: string[]) {
@@ -288,7 +284,9 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
 
     try {
         const { client, api } = await openSession(main);
-        const kinds = opts.kinds ?? enabledKinds(main);
+        // A manual push names its kinds for every folder; otherwise each folder
+        // follows its own setting (or the general one).
+        const kindsFor = (pair: Pair) => opts.kinds ?? folderKinds(main, pair);
         const plans: { pair: Pair; plan: Plan }[] = [];
 
         for (const pair of pairs) {
@@ -296,6 +294,7 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
             mirrors.set(pair, mirror);
             try {
                 await mirror.run({ full: opts.full });
+                const kinds = kindsFor(pair);
                 if (!kinds.size || mirror.failures) continue;
                 const full = await planUploads(pair.db, pair.local, { allowMassDelete: opts.allowMassDelete });
                 // Remember held mass deletions so the app can ask about them.
@@ -328,9 +327,9 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
             // One space budget for every folder: only uploads that fit are tried.
             const needsSpace = work.some(({ plan }) => plan.items.some((i) => i.action === 'upload' || i.action === 'update'));
             const budget = new SpaceBudget(needsSpace ? await spaceLeft(api, main) : Infinity);
-            for (const { pair, plan } of work) await mirrors.get(pair)!.applyPlan(plan, kinds, budget);
-            if (kinds.has('new') || kinds.has('edits')) reportSpace(main, budget);
-        } else if (kinds.has('new') || kinds.has('edits')) {
+            for (const { pair, plan } of work) await mirrors.get(pair)!.applyPlan(plan, kindsFor(pair), budget);
+            if (pairs.some((p) => kindsFor(p).has('new') || kindsFor(p).has('edits'))) reportSpace(main, budget);
+        } else if (pairs.some((p) => kindsFor(p).has('new') || kindsFor(p).has('edits'))) {
             reportSpace(main, new SpaceBudget(Infinity));
         }
     } catch (error) {
@@ -418,6 +417,10 @@ async function status(main: DatabaseSync) {
             firstSyncDone: !!getMeta(p.db, 'event_id'),
             reviewCount: reviewCount(p.db),
             excludes: excludeSettings(p.db),
+            uploads: {
+                own: p.kind === 'computer' && getMeta(p.db, 'uploads') !== undefined,
+                kinds: [...folderKinds(main, p)],
+            },
         })),
         computerName: os.hostname(),
         // The account the current sync setup belongs to (may differ from the
@@ -529,6 +532,21 @@ async function main(command: string | undefined, args: string[]) {
                     `${m.files.toLocaleString()} files (${humanSize(m.bytes)}); after skipping node_modules, .git, caches and similar: ` +
                         `${m.includedFiles.toLocaleString()} files (${humanSize(m.includedBytes)}).`,
                 );
+            }
+            if (action === 'uploads') {
+                const pair = target ? findPair(main, target) : undefined;
+                if (!pair) throw new UserError('Usage: folders uploads <dir|id> [default | none | <kinds>...]');
+                const words = positional.slice(2);
+                if (words.length) {
+                    if (pair.kind !== 'computer') throw new UserError("My Files uses the general setting: config uploads <kinds>|none");
+                    if (words[0] === 'default') pair.db.prepare("DELETE FROM meta WHERE key = 'uploads'").run();
+                    else setMeta(pair.db, 'uploads', words[0] === 'none' ? '' : [...parseKinds(words)].join(','));
+                    notifyChanged();
+                }
+                const own = pair.kind === 'computer' && getMeta(pair.db, 'uploads') !== undefined;
+                const kinds = [...folderKinds(main, pair)];
+                if (json) return console.log(JSON.stringify({ own, kinds }));
+                return console.log(`${pair.local} uploads: ${kinds.length ? kinds.join(', ') : 'nothing (download only)'}${own ? ' (its own setting)' : ' (general setting)'}`);
             }
             if (action === 'excludes') {
                 if (!target) throw new UserError('Usage: folders excludes <dir|id> [--defaults on|off] [--set <pattern>...]');
@@ -749,7 +767,7 @@ async function main(command: string | undefined, args: string[]) {
             acquireLock(STATE_DIR);
             try {
                 const { client } = await openSession(main);
-                await mirrorFor(client, main, pair).resolve(uid, action, { uploadsEdits: enabledKinds(main).has('edits') });
+                await mirrorFor(client, main, pair).resolve(uid, action, { uploadsEdits: folderKinds(main, pair).has('edits') });
             } finally {
                 notifyChanged();
             }

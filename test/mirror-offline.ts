@@ -849,6 +849,20 @@ try {
     await fs.rm(otherDrive, { recursive: true, force: true });
 }
 
+// 25c. Per-folder upload settings: own setting wins; otherwise the general one.
+const { folderKinds } = await import('../src/pairs.ts');
+const kindsOf = (label: string) => [...folderKinds(db, listPairs(db).find((p) => p.label === label)!)].sort();
+db.prepare("INSERT INTO meta (key, value) VALUES ('uploads', 'new,edits') ON CONFLICT(key) DO UPDATE SET value = excluded.value").run();
+assert.deepEqual(kindsOf('Documents'), ['edits', 'new'], 'no own setting: follows the general one');
+listPairs(db).find((p) => p.label === 'Documents')!.db.prepare("INSERT INTO meta (key, value) VALUES ('uploads', 'new,deletes')").run();
+assert.deepEqual(kindsOf('Documents'), ['deletes', 'new'], 'own setting wins');
+listPairs(db).find((p) => p.label === 'Documents')!.db.prepare("UPDATE meta SET value = '' WHERE key = 'uploads'").run();
+assert.deepEqual(kindsOf('Documents'), [], 'own setting can be "nothing" (download only)');
+assert.deepEqual(kindsOf('My Files'), ['edits', 'new'], 'My Files follows the general setting');
+listPairs(db).find((p) => p.label === 'Documents')!.db.prepare("DELETE FROM meta WHERE key = 'uploads'").run();
+assert.deepEqual(kindsOf('Documents'), ['edits', 'new'], 'back to the general setting');
+console.log('✓ per-folder upload settings: own setting wins (even "none"), otherwise the general one');
+
 // 26. A different account starts fresh: pairings forgotten, uploads off, files and preferences kept.
 const { startFreshForNewAccount } = await import('../src/pairs.ts');
 db.prepare("INSERT INTO meta (key, value) VALUES ('uploads', 'new,edits,moves,deletes') ON CONFLICT(key) DO UPDATE SET value = excluded.value").run();

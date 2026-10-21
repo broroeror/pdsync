@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { DeviceType, DriveEventType, type ProtonDriveClient } from '@protontech/drive-sdk';
-import { getMeta, LAYOUT_VERSION, openState, setMeta, STATE_DIR } from './mirror.ts';
+import { getMeta, LAYOUT_VERSION, openState, setMeta, STATE_DIR, type UploadKind } from './mirror.ts';
 import { assertMounted, measure } from './trash.ts';
 
 export type Pair = {
@@ -238,3 +238,22 @@ export async function relocatePair(main: DatabaseSync, pair: Pair, newLocal: str
     if (pair.kind === 'computer') main.prepare('UPDATE pairs SET local = ? WHERE id = ?').run(target, pair.id);
     return { from: old, to: target };
 }
+
+export const UPLOAD_KINDS: UploadKind[] = ['new', 'edits', 'moves', 'deletes'];
+
+/** Upload kinds switched on for automatic runs. */
+export function enabledKinds(main: DatabaseSync) {
+    return new Set((getMeta(main, 'uploads') ?? '').split(',').filter((k): k is UploadKind => UPLOAD_KINDS.includes(k as UploadKind)));
+}
+
+/**
+ * Upload kinds for one folder: its own setting if it has one (folders added
+ * from this computer can), else the general one. Stored in the folder's own
+ * records as a comma list; absent = follow the general setting.
+ */
+export function folderKinds(main: DatabaseSync, pair: Pair) {
+    const own = pair.kind === 'computer' ? getMeta(pair.db, 'uploads') : undefined;
+    if (own === undefined) return enabledKinds(main);
+    return new Set(own.split(',').filter((k): k is UploadKind => UPLOAD_KINDS.includes(k as UploadKind)));
+}
+

@@ -285,6 +285,8 @@ class Backend(QObject):
                 "label": f["label"],
                 "local": f["local"],
                 "pending": not f.get("firstSyncDone"),
+                "uploadsOwn": bool((f.get("uploads") or {}).get("own")),
+                "uploadKinds": list((f.get("uploads") or {}).get("kinds") or []),
                 "excludeDefaults": (f.get("excludes") or {}).get("defaults", True),
                 "excludeCustom": "\n".join((f.get("excludes") or {}).get("custom", [])),
             }
@@ -528,6 +530,12 @@ class Backend(QObject):
     def setUploadKind(self, kind: str, enabled: bool):
         kinds = [k for k in ("new", "edits", "moves", "deletes") if (k == kind and enabled) or (k != kind and k in self.uploadKinds)]
         self._action("uploads", ["config", "uploads", *kinds] if kinds else ["config", "uploads", "none"])
+
+    @Slot(str, bool, "QStringList")
+    def setFolderUploads(self, folder_id: str, own: bool, kinds: list):
+        """A folder's own upload kinds, or (own=False) back to the general setting."""
+        words = (list(kinds) or ["none"]) if own else ["default"]
+        self._action("uploads", ["folders", "uploads", folder_id, *words])
 
     @Slot()
     def confirmMassDelete(self):

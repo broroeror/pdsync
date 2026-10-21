@@ -94,6 +94,29 @@ ScrollView {
                                 elide: Text.ElideRight
                                 Layout.fillWidth: true
                             }
+                            Label {
+                                visible: modelData.uploadsOwn
+                                text: "Own upload settings: " + page.describeKinds(modelData.uploadKinds)
+                                opacity: 0.65
+                                font.pointSize: 8.5
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
+                            }
+                        }
+                        ToolButton {
+                            // Our own gear: icon themes name and draw "configure" differently
+                            // (WhiteSur's/Breeze's are sliders), and styles differ in whether
+                            // they tint a bundled icon, so pick the version that contrasts
+                            // with the theme's text colour (the flat button sits on the window).
+                            icon.source: Qt.resolvedUrl(palette.windowText.hslLightness > 0.5
+                                ? "../icons/gear-light.svg" : "../icons/gear-dark.svg")
+                            icon.color: "transparent"
+                            display: AbstractButton.IconOnly
+                            text: "Upload settings for this folder"
+                            enabled: !backend.busyAction
+                            ToolTip.visible: hovered
+                            ToolTip.text: text
+                            onClicked: uploadsEditor.openFor(modelData)
                         }
                         Button {
                             text: "Exclusions…"
@@ -158,7 +181,8 @@ ScrollView {
                     }
                 }
                 Label {
-                    text: "Unticked kinds stay on your computer only. Files changed on both sides always go to Review, "
+                    text: "These apply to My Files and to every folder without its own settings (the gear next to a folder above). "
+                        + "Unticked kinds stay on your computer only. Files changed on both sides always go to Review, "
                         + "and deleting many files at once always asks first."
                     wrapMode: Text.WordWrap
                     opacity: 0.7
@@ -342,6 +366,85 @@ ScrollView {
             }
         }
         onAccepted: backend.setExcludes(folder.id, defaultsBox.checked, customArea.text)
+    }
+
+    readonly property var kindLabels: ({
+        new: "new files and folders", edits: "edits", moves: "renames and moves", deletes: "deletions"
+    })
+    function describeKinds(kinds) {
+        const names = ["new", "edits", "moves", "deletes"].filter((k) => kinds.indexOf(k) >= 0).map((k) => kindLabels[k])
+        return names.length ? names.join(", ") : "nothing (download only)"
+    }
+
+    Dialog {
+        id: uploadsEditor
+        objectName: "uploadsEditor"
+        property var folder: null
+        function openFor(f) {
+            folder = f
+            ownBox.checked = f.uploadsOwn
+            const start = f.uploadsOwn ? f.uploadKinds : backend.uploadKinds
+            for (let i = 0; i < kindBoxes.count; i++) {
+                const box = kindBoxes.itemAt(i)
+                box.checked = start.indexOf(box.kind) >= 0
+            }
+            open()
+        }
+        title: folder ? `Uploads for ${folder.label}` : ""
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: Math.min(page.width - 40, 520)
+        standardButtons: Dialog.Save | Dialog.Cancel
+        // Height from its parts (see the other dialogs: the KDE style otherwise
+        // measures too early and the buttons overlap the content).
+        height: implicitHeaderHeight + uploadsContent.implicitHeight + implicitFooterHeight + topPadding + bottomPadding + 2 * spacing
+        ColumnLayout {
+            id: uploadsContent
+            width: uploadsEditor.availableWidth
+            RadioButton {
+                text: "Use the general upload settings"
+                checked: !ownBox.checked
+                onClicked: ownBox.checked = false
+            }
+            RadioButton {
+                id: ownBox
+                text: "Custom for this folder:"
+            }
+            Repeater {
+                id: kindBoxes
+                model: [
+                    { kind: "new", label: "New files and folders" },
+                    { kind: "edits", label: "Edited files (as new versions; Drive keeps the old ones)" },
+                    { kind: "moves", label: "Renames and moves" },
+                    { kind: "deletes", label: "Deletions (moved to Drive's trash, restorable there)" },
+                ]
+                delegate: CheckBox {
+                    required property var modelData
+                    readonly property string kind: modelData.kind
+                    text: modelData.label
+                    enabled: ownBox.checked
+                    Layout.leftMargin: 28
+                }
+            }
+            Label {
+                text: ownBox.checked
+                    ? "This folder ignores the general settings and uploads only what's ticked here."
+                    : "Currently: " + page.describeKinds(backend.uploadKinds) + " (from the general settings below)."
+                wrapMode: Text.WordWrap
+                opacity: 0.7
+                font.pointSize: 8.5
+                Layout.fillWidth: true
+                Layout.topMargin: 4
+            }
+        }
+        onAccepted: {
+            const kinds = []
+            for (let i = 0; i < kindBoxes.count; i++) {
+                const box = kindBoxes.itemAt(i)
+                if (box.checked) kinds.push(box.kind)
+            }
+            backend.setFolderUploads(folder.id, ownBox.checked, kinds)
+        }
     }
 
     FolderDialog {

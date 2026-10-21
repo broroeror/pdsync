@@ -4,7 +4,7 @@
         python3 tools/render_screens.py OUT.png TAB [SCENARIO]
 
 TAB: 0 = Status, 1 = Review, 2 = Settings.
-SCENARIO: ok (default) | syncing | stopped | full | measured | loggedout | humancheck | move
+SCENARIO: ok (default) | syncing | stopped | full | measured | loggedout | humancheck | move | folderuploads
 Used to check layouts without touching a real account or the real state.
 """
 
@@ -15,7 +15,8 @@ import time
 from pathlib import Path
 
 import shiboken6
-from PySide6.QtCore import QObject, QTimer, QUrl, Slot
+from PySide6.QtCore import Q_ARG, QMetaObject, QObject, QTimer, QUrl, Slot
+from PySide6.QtGui import QIcon
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuick import QQuickWindow
 from PySide6.QtWidgets import QApplication
@@ -42,6 +43,14 @@ class Fake(B.Backend):
 
 
 app = QApplication([])
+if os.environ.get("RENDER_DARK"):  # a dark palette, like a dark desktop theme
+    from PySide6.QtGui import QColor, QPalette
+    pal = QPalette()
+    for role, c in [(QPalette.Window, "#202326"), (QPalette.WindowText, "#e8e8e8"), (QPalette.Base, "#141618"),
+                    (QPalette.Text, "#e8e8e8"), (QPalette.Button, "#2e3236"), (QPalette.ButtonText, "#e8e8e8")]:
+        pal.setColor(role, QColor(c))
+    app.setPalette(pal)
+QIcon.setThemeName(os.environ.get("RENDER_ICON_THEME", "breeze"))
 fake = Fake()
 fake._activity = [
     {"timeMs": now - 1000, "kind": "created", "path": "Projects/site/", "folder": "Documents", "detail": "folder created on Drive"},
@@ -61,7 +70,8 @@ fake._status = {
         {"id": "myfiles", "kind": "myfiles", "label": "My Files", "local": "/home/user/DriveMirror",
          "firstSyncDone": True, "excludes": {"defaults": True, "custom": []}},
         {"id": "a1", "kind": "computer", "label": "Documents", "local": "/home/user/Documents",
-         "firstSyncDone": False, "excludes": {"defaults": True, "custom": ["*.iso", "Projects/old"]}},
+         "firstSyncDone": False, "excludes": {"defaults": True, "custom": ["*.iso", "Projects/old"]},
+         "uploads": {"own": True, "kinds": ["new", "edits"]}},
     ],
     "lastRun": {"finishedMs": now - 60_000, "downloaded": 0, "skipped": 0, "failures": 0,
                 "errorKind": "stopped" if scenario == "stopped" else None,
@@ -98,5 +108,10 @@ if scenario == "measured":
     ))
 if scenario == "move":
     QTimer.singleShot(300, lambda: fake.moveProposed.emit("myfiles", "/home/user/DriveMirror", "/mnt/BigDrive/DriveMirror"))
+if scenario == "folderuploads":
+    def open_uploads():
+        docs = next(f for f in fake.folders if f["id"] == "a1")
+        QMetaObject.invokeMethod(win.findChild(QObject, "uploadsEditor"), "openFor", Q_ARG("QVariant", docs))
+    QTimer.singleShot(300, open_uploads)
 QTimer.singleShot(800, lambda: (win.grabWindow().save(out), app.quit()))
 app.exec()
