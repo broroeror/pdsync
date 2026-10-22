@@ -2,7 +2,7 @@
 Description=Run the Drive mirror periodically
 
 [Timer]
-OnStartupSec=2min
+OnActiveSec=2min
 OnUnitActiveSec=5min
 
 [Install]

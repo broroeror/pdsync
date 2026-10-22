@@ -24,6 +24,17 @@ const PACKAGED_TIMER = `/usr/lib/systemd/user/${UNIT}.timer`;
 const DESCRIPTION = 'Download-only Drive mirror (third-party, not supported by Proton)';
 const DEFAULT_INTERVAL_MINUTES = 5;
 
+/**
+ * The timer's triggers: a first run shortly after the timer starts (at login,
+ * or when the service is switched on), then one per interval after each run.
+ * Every monotonic trigger is written together because an empty assignment of
+ * any one of them clears them all; a drop-in that only re-set the interval
+ * left nothing to start the first run, so the timer never fired.
+ */
+function timerTriggers(intervalMinutes: number) {
+    return `OnActiveSec=2min\nOnUnitActiveSec=${intervalMinutes}min\n`;
+}
+
 function systemctl(...args: string[]) {
     return execFileSync('systemctl', ['--user', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 }
@@ -76,8 +87,8 @@ function writeSourceUnits(intervalMinutes: number) {
     );
     fs.writeFileSync(
         path.join(UNIT_DIR, `${UNIT}.timer`),
-        `[Unit]\nDescription=Run the Drive mirror every ${intervalMinutes} minutes\n\n[Timer]\nOnStartupSec=2min\n` +
-            `OnUnitActiveSec=${intervalMinutes}min\n\n[Install]\nWantedBy=timers.target\n`,
+        `[Unit]\nDescription=Run the Drive mirror every ${intervalMinutes} minutes\n\n[Timer]\n` +
+            `${timerTriggers(intervalMinutes)}\n[Install]\nWantedBy=timers.target\n`,
     );
 }
 
@@ -89,8 +100,8 @@ export function installService(db: DatabaseSync, intervalMinutes = DEFAULT_INTER
     if (PACKAGED) {
         removeOwnUserUnits();
         fs.mkdirSync(path.dirname(DROP_IN), { recursive: true });
-        // An empty assignment clears the packaged interval before setting ours.
-        fs.writeFileSync(DROP_IN, `[Timer]\nOnUnitActiveSec=\nOnUnitActiveSec=${intervalMinutes}min\n`);
+        // An empty assignment clears the packaged triggers before setting ours.
+        fs.writeFileSync(DROP_IN, `[Timer]\nOnUnitActiveSec=\n${timerTriggers(intervalMinutes)}`);
     } else {
         writeSourceUnits(intervalMinutes);
     }
@@ -136,7 +147,34 @@ function nextRunMs(): number | null {
 
 export type ServiceInfo = { enabled: boolean; intervalMinutes: number | null; nextRunMs: number | null };
 
+/**
+ * Rewrite a timer written by pdsync 0.1.0, whose interval drop-in cleared the
+ * first-run trigger, so automatic sync never started. Runs once per affected
+ * install; afterwards the file has OnActiveSec= and this does nothing.
+ */
+function repairOldTimer() {
+    const file = PACKAGED ? DROP_IN : path.join(UNIT_DIR, `${UNIT}.timer`);
+    let text: string;
+    try {
+        text = fs.readFileSync(file, 'utf8');
+    } catch {
+        return;
+    }
+    if (text.includes('OnActiveSec=')) return;
+    if (!PACKAGED && !text.includes('Run the Drive mirror every')) return;
+    const minutes = intervalIn(file) ?? DEFAULT_INTERVAL_MINUTES;
+    if (PACKAGED) fs.writeFileSync(DROP_IN, `[Timer]\nOnUnitActiveSec=\n${timerTriggers(minutes)}`);
+    else writeSourceUnits(minutes);
+    try {
+        systemctl('daemon-reload');
+        if (systemctl('is-enabled', `${UNIT}.timer`).trim() === 'enabled') systemctl('restart', `${UNIT}.timer`);
+    } catch {
+        // Not enabled (is-enabled exits non-zero); the fixed file applies when it is.
+    }
+}
+
 export function serviceInfo(): ServiceInfo {
+    repairOldTimer();
     let enabled = false;
     try {
         enabled = systemctl('is-active', `${UNIT}.timer`).trim() === 'active';
