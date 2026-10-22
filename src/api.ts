@@ -4,7 +4,7 @@ import type { ProtonDriveHTTPClient } from '@protontech/drive-sdk';
 
 // Per the SDK usage guidelines: `external-drive-{name}@{semver}-{channel}`.
 // The name is a placeholder until the project has a final (non-Proton) name.
-export const APP_VERSION = 'external-drive-pdsync@0.1.0-alpha';
+export const APP_VERSION = 'external-drive-pdsync@0.1.1-alpha';
 export const API_BASE = 'https://drive-api.proton.me';
 
 // Core API success codes: 1000 = OK, 1001 = OK (multi-status).

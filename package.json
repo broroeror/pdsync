@@ -1,6 +1,6 @@
 {
   "name": "proton-drive-sync",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Unofficial Linux mirror client for Proton Drive (third-party, not supported by Proton)",
   "scripts": {
     "test": "tsx --import ./src/preload.ts test/crypto-offline.ts && tsx --import ./src/preload.ts test/pubkey-offline.ts && tsx --import ./src/preload.ts test/client-offline.ts && tsx --import ./src/preload.ts test/login-offline.ts && tsx --import ./src/preload.ts test/exclude-offline.ts && tsx --import ./src/preload.ts test/mirror-offline.ts && tsx --import ./src/preload.ts test/plan-offline.ts && tsx --import ./src/preload.ts test/trash-offline.ts && tsx --import ./src/preload.ts test/lock-offline.ts",

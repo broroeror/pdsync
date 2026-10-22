@@ -1,6 +1,6 @@
 # Maintainer: broroeror <54515333+broroeror@users.noreply.github.com>
 pkgname=pdsync
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Unofficial Proton Drive sync client with a tray app (third-party, not supported by Proton)"
 arch=('any')
