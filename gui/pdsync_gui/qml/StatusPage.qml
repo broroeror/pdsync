@@ -156,6 +156,7 @@ ColumnLayout {
 
         ListView {
             id: activityList
+            FastWheel { flick: activityList }
             anchors.fill: parent
             clip: true
             model: backend.activity

@@ -32,6 +32,7 @@ ColumnLayout {
 
     ListView {
         id: reviewList
+        FastWheel { flick: reviewList }
         clip: true
         spacing: 10
         model: backend.reviewItems

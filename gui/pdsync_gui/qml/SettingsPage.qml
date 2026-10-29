@@ -6,6 +6,7 @@ import QtQuick.Layouts
 ScrollView {
     id: page
     contentWidth: availableWidth
+    FastWheel { flick: page.contentItem }
 
     ColumnLayout {
         width: page.availableWidth
@@ -350,8 +351,10 @@ ScrollView {
                 Layout.topMargin: 8
             }
             ScrollView {
+                id: customScroll
                 Layout.fillWidth: true
                 Layout.preferredHeight: 120
+                FastWheel { flick: customScroll.contentItem }
                 TextArea {
                     id: customArea
                     placeholderText: "e.g.\n*.iso\nProjects/old"
