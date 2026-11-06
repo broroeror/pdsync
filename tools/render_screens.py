@@ -4,7 +4,7 @@
         python3 tools/render_screens.py OUT.png TAB [SCENARIO]
 
 TAB: 0 = Status, 1 = Review, 2 = Settings.
-SCENARIO: ok (default) | syncing | stopped | full | measured | loggedout | humancheck | move | folderuploads
+SCENARIO: ok (default) | syncing | catchup | counting | stopped | full | measured | loggedout | humancheck | move | folderuploads
 Used to check layouts without touching a real account or the real state.
 """
 
@@ -63,9 +63,15 @@ fake._status = {
     "folder": "/home/user/DriveMirror",
     "firstSyncDone": True,
     "computerName": "my-pc",
-    "running": scenario == "syncing",
+    "running": scenario in ("syncing", "catchup", "counting"),
     "progress": {"startedMs": now - 3_180_000, "lastMs": now - 1000, "lastItem": "Projects/site/index.html",
-                 "folder": "Documents", "created": 9985, "uploaded": 120, "downloaded": 3} if scenario == "syncing" else None,
+                 "folder": "Documents", "created": 9985, "uploaded": 120, "downloaded": 3,
+                 "step": {"kind": "upload", "done": 10105, "total": 31048, "folder": "Documents", "startedMs": now - 3_180_000}}
+                if scenario == "syncing" else
+                {"startedMs": now - 4_000_000, "lastMs": 0, "step": {"kind": "catchup", "done": 12400, "total": 45120, "folder": "Documents", "startedMs": now - 4_000_000}}
+                if scenario == "catchup" else
+                {"startedMs": now - 20_000, "lastMs": 0, "step": {"kind": "counting", "done": 3000, "total": 0, "folder": "Documents", "startedMs": now - 20_000}}
+                if scenario == "counting" else None,
     "folders": [
         {"id": "myfiles", "kind": "myfiles", "label": "My Files", "local": "/home/user/DriveMirror",
          "firstSyncDone": True, "excludes": {"defaults": True, "custom": []}},

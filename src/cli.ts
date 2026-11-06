@@ -8,7 +8,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { ProtonDriveClient } from '@protontech/drive-sdk';
 import { ApiError } from './api.ts';
 import { acquireLock, lockHolder } from './lock.ts';
-import { addActivity, finishRun, getMeta, Mirror, openState, requestStop, setMeta, SpaceBudget, startRun, STATE_DIR, stopRequested, StopRequested, type UploadKind } from './mirror.ts';
+import { addActivity, finishRun, getMeta, Mirror, openState, requestStop, setMeta, SpaceBudget, startRun, STATE_DIR, stopRequested, StopRequested, type SyncStep, type UploadKind } from './mirror.ts';
 import type { Api } from './api.ts';
 import { DEFAULT_EXCLUDES, excludeSettings, makeExcluder, saveExcludeSettings } from './exclude.ts';
 import { addPair, checkNewLocal, enabledKinds, folderKinds, listPairs, relocatePair, removePair, startFreshForNewAccount, UPLOAD_KINDS, type Pair } from './pairs.ts';
@@ -158,7 +158,11 @@ function mirrorFor(
     client: ProtonDriveClient,
     main: DatabaseSync,
     pair: Pair,
-    hooks: { onActivity?: (kind: string, rel: string) => void; onScan?: (checked: number) => void } = {},
+    hooks: {
+        onActivity?: (kind: string, rel: string) => void;
+        onScan?: (checked: number) => void;
+        onStep?: (step: SyncStep | null) => void;
+    } = {},
 ) {
     return new Mirror(client, pair.db, pair.local, { remoteRootUid: pair.remoteUid, trash: trashTarget(main), ...hooks });
 }
@@ -245,7 +249,15 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
     const mirrors = new Map<Pair, Mirror>();
 
     // Live progress for the app, written at most about once a second.
-    const progress = { startedMs: Date.now(), lastMs: 0, lastItem: '', folder: '', scanning: '', scanned: 0 };
+    const progress = {
+        startedMs: Date.now(),
+        lastMs: 0,
+        lastItem: '',
+        folder: '',
+        scanning: '',
+        scanned: 0,
+        step: null as (SyncStep & { folder: string; startedMs: number }) | null,
+    };
     let lastWrite = 0;
     let pending: NodeJS.Timeout | undefined;
     const writeProgress = () => {
@@ -268,6 +280,11 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
         Object.assign(progress, { scanning: folder, scanned: checked });
         soon();
     };
+    const onStep = (folder: string) => (step: SyncStep | null) => {
+        const startedMs = step?.kind === progress.step?.kind ? progress.step!.startedMs : Date.now();
+        Object.assign(progress, { step: step && { ...step, folder, startedMs }, scanning: '' });
+        soon();
+    };
     const endProgress = () => {
         clearTimeout(pending);
         main.prepare("DELETE FROM meta WHERE key = 'progress'").run();
@@ -282,6 +299,7 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
         totals.failures += m.failures;
     };
 
+    writeProgress();
     try {
         const { client, api } = await openSession(main);
         // A manual push names its kinds for every folder; otherwise each folder
@@ -290,7 +308,11 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
         const plans: { pair: Pair; plan: Plan }[] = [];
 
         for (const pair of pairs) {
-            const mirror = mirrorFor(client, main, pair, { onActivity: onActivity(pair.label), onScan: onScan(pair.label) });
+            const mirror = mirrorFor(client, main, pair, {
+                onActivity: onActivity(pair.label),
+                onScan: onScan(pair.label),
+                onStep: onStep(pair.label),
+            });
             mirrors.set(pair, mirror);
             try {
                 await mirror.run({ full: opts.full });
@@ -676,6 +698,9 @@ async function main(command: string | undefined, args: string[]) {
             }
             if (!s.folders.length) console.log('Folders:     none yet');
             console.log(`Running now: ${s.running ? 'yes' : 'no'}`);
+            const step = s.running ? s.progress?.step : null;
+            if (step?.kind === 'counting') console.log(`  Reading Drive's list of changes: ${step.done} so far`);
+            else if (step) console.log(`  ${step.kind === 'catchup' ? 'Checking Drive changes' : 'Uploading'} (${step.folder}): ${step.done} of ${step.total}`);
             if (s.lastRun) {
                 const r = s.lastRun;
                 console.log(

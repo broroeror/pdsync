@@ -51,6 +51,21 @@ def describe_version(side: dict | None) -> dict:
     }
 
 
+def time_left(step: dict) -> str:
+    """'about 2 h 15 min left', from the average pace of this step so far."""
+    elapsed = time.time() - step["startedMs"] / 1000
+    if step["done"] < 10 or elapsed < 15:
+        return "working out the time left"
+    minutes = elapsed / step["done"] * (step["total"] - step["done"]) / 60
+    if minutes < 1:
+        return "less than a minute left"
+    if minutes < 60:
+        return f"about {round(minutes)} min left"
+    minutes = round(minutes / 5) * 5  # to the nearest 5: more precision would be false
+    hours, rest = divmod(minutes, 60)
+    return f"about {hours} h {rest} min left" if rest else f"about {hours} h left"
+
+
 def clock_time(ms: int | None) -> str:
     """'11:38:24' today (with seconds, so progress is visible), else date + time."""
     if not ms:
@@ -334,6 +349,9 @@ class Backend(QObject):
             if p.get(key):
                 parts.append(f"{locale.toString(p[key])} {label}")
         text = f"Since {clock_time(p.get('startedMs'))}: " + (", ".join(parts) if parts else "checking for changes")
+        step = p.get("step")
+        if step and step["kind"] != "upload":
+            return text + f"\nCatching up with changes on Drive ({step['folder']})"
         if p.get("scanning"):
             text += f"\nChecking {p['scanning']} on Drive… {locale.toString(p.get('scanned', 0))} folders so far"
             return text
@@ -342,6 +360,27 @@ class Backend(QObject):
             folder = f"{p['folder']} › " if p.get("folder") and len(self._status.get("folders") or []) > 1 else ""
             text += f"\nLast change {clock_time(p['lastMs'])}: {folder}{item}"
         return text
+
+    def _step(self):
+        return (self._status.get("progress") or {}).get("step")
+
+    @Property(float, notify=changed)
+    def progressValue(self) -> float:
+        """How far the current step is, 0 to 1; negative when there's no total to measure against."""
+        step = self._step()
+        return step["done"] / step["total"] if step and step["total"] else -1.0
+
+    @Property(str, notify=changed)
+    def progressDetail(self) -> str:
+        """The line under the progress bar: counts and the time left."""
+        step = self._step()
+        if not step:
+            return ""
+        locale = QLocale.system()
+        if step["kind"] == "counting":
+            return f"Reading Drive's list of changes… {locale.toString(step['done'])} so far"
+        verb = "checked" if step["kind"] == "catchup" else "done"
+        return f"{locale.toString(step['done'])} of {locale.toString(step['total'])} {verb} · {time_left(step)}"
 
     @Property(bool, notify=changed)
     def running(self) -> bool:

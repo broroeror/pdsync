@@ -45,6 +45,24 @@ ColumnLayout {
         }
     }
 
+    ColumnLayout {
+        visible: backend.running
+        spacing: 4
+        Layout.fillWidth: true
+        ProgressBar {
+            indeterminate: backend.progressValue < 0
+            value: Math.max(backend.progressValue, 0)
+            Layout.fillWidth: true
+        }
+        Label {
+            visible: !!backend.progressDetail
+            text: backend.progressDetail
+            opacity: 0.65
+            font.pointSize: 8.5
+            Layout.fillWidth: true
+        }
+    }
+
     Label {
         visible: backend.state === "error" && !!backend.lastError
         text: backend.lastError

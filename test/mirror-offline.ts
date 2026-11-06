@@ -6,7 +6,7 @@ import path from 'node:path';
 
 const scratch = await fs.mkdtemp(path.join(process.env.PDSYNC_TEST_TMP || os.tmpdir(), 'pdsync-test-'));
 process.env.XDG_STATE_HOME = path.join(scratch, 'state');
-const { Mirror, openState, requestStop, resetStop } = await import('../src/mirror.ts');
+const { Mirror, openState, requestStop, resetStop, StopRequested } = await import('../src/mirror.ts');
 const { NodeWithSameNameExistsValidationError, ValidationError } = await import('@protontech/drive-sdk');
 const { SpaceBudget } = await import('../src/mirror.ts');
 
@@ -877,6 +877,36 @@ assert.equal((db.prepare('SELECT COUNT(*) AS n FROM nodes').get() as any).n, 0);
 assert.equal((await fs.readdir(root)).length, filesBefore, 'local files untouched');
 assert.equal(await fs.readFile(path.join(docsMoved, 'a.txt'), 'utf8'), 'A doc', 'computer folder files untouched');
 console.log('✓ a different account starts fresh: pairings forgotten, uploads off, files and preferences kept');
+
+// Progress: Drive's changes are counted first, and a stop part-way keeps the place.
+{
+    const stepRoot = path.join(scratch, 'steps');
+    const stepDb = openState(path.join(scratch, 'steps.db'));
+    const stepDrive = new FakeDrive();
+    await new Mirror(stepDrive.client(), stepDb, stepRoot).run();
+    for (const n of ['s1', 's2', 's3']) {
+        stepDrive.add({ uid: n, parentUid: 'root', name: `${n}.txt`, type: 'file', rev: `${n}r`, content: n });
+    }
+    const steps: any[] = [];
+    const stopAfterOne = new Mirror(stepDrive.client(), stepDb, stepRoot, {
+        onStep: (s) => steps.push(s),
+        onActivity: () => requestStop(),
+    });
+    await assert.rejects(stopAfterOne.run(), StopRequested);
+    resetStop();
+    assert.deepEqual(steps.slice(0, 4).map((s) => [s.kind, s.done, s.total]), [
+        ['counting', 1, 0], ['counting', 2, 0], ['counting', 3, 0], ['catchup', 0, 3],
+    ]);
+    assert.equal((await fs.readdir(stepRoot)).length, 1, 'stopped after one change');
+
+    const finished: any[] = [];
+    await new Mirror(stepDrive.client(), stepDb, stepRoot, { onStep: (s) => finished.push(s) }).run();
+    assert.deepEqual((await fs.readdir(stepRoot)).sort(), ['s1.txt', 's2.txt', 's3.txt'], 'the next run carries on');
+    assert.equal(finished.find((s) => s?.kind === 'catchup').total, 2, 'only what was left is counted');
+    assert.equal(finished.at(-1), null, 'the step ends');
+    stepDb.close();
+}
+console.log('✓ changes on Drive are counted up front; a stop part-way keeps the place');
 
 await fs.rm(scratch, { recursive: true, force: true });
 console.log('\nall mirror checks passed');

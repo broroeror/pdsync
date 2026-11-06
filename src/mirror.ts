@@ -18,6 +18,7 @@ import {
     NodeWithSameNameExistsValidationError,
     type NodeEntity,
     type ProtonDriveClient,
+    type DriveEvent,
 } from '@protontech/drive-sdk';
 import { kindOf, type Plan, type PlanItem, type UploadKind } from './plan.ts';
 export { kindOf, type UploadKind };
@@ -289,6 +290,9 @@ function mediaTypeOf(rel: string) {
     return MEDIA_TYPES[ext] ?? 'application/octet-stream';
 }
 
+/** A long step of a sync: counting Drive's changes, checking them, or uploading. */
+export type SyncStep = { kind: 'counting' | 'catchup' | 'upload'; done: number; total: number };
+
 export class Mirror {
     private rootUid = '';
     private needsRescan = false;
@@ -316,6 +320,8 @@ export class Mirror {
             onActivity?: (kind: string, rel: string) => void;
             /** Called while scanning Drive, with the number of folders checked so far. */
             onScan?: (foldersChecked: number) => void;
+            /** Called as a long step advances (for the progress bar); null when it ends. */
+            onStep?: (step: SyncStep | null) => void;
         } = {},
     ) {}
 
@@ -366,8 +372,20 @@ export class Mirror {
             return;
         }
 
+        // Read the whole list first: Drive doesn't say how long it is, and reading
+        // it is quick next to checking each change, so this gives a real total.
+        const events: DriveEvent[] = [];
         for await (const event of this.client.iterateEvents(scope, cursor, stopper.controller.signal)) {
             checkStop();
+            events.push(event);
+            this.options.onStep?.({ kind: 'counting', done: events.length, total: 0 });
+            // The feed ends with an error after this; handle the event below instead.
+            if (event.type === DriveEventType.TreeRemove) break;
+        }
+
+        for (const [index, event] of events.entries()) {
+            checkStop();
+            this.options.onStep?.({ kind: 'catchup', done: index, total: events.length });
             switch (event.type) {
                 case DriveEventType.NodeCreated:
                 case DriveEventType.NodeUpdated:
@@ -387,6 +405,7 @@ export class Mirror {
             if (this.failures) break;
             if (event.eventId !== 'none') setMeta(this.db, 'event_id', event.eventId);
         }
+        this.options.onStep?.(null);
 
         if (this.needsRescan && !this.failures) await this.fullWalk(rootNode);
         await this.recheckReview();
@@ -677,6 +696,8 @@ export class Mirror {
         const destination = (item: PlanItem) => (item.action === 'move' ? item.to : item.rel);
 
         let pending = plan.items.filter((i) => kinds.has(kindOf(i)));
+        const total = pending.length;
+        let done = 0;
         while (pending.length) {
             const waiting: PlanItem[] = [];
             for (const item of pending) {
@@ -691,6 +712,7 @@ export class Mirror {
                 else if (item.action === 'move') await this.moveOnDrive(item, parent!);
                 else if (item.action === 'update') await this.uploadEdit(item.uid, item.rel, budget);
                 else if (item.action === 'trash') await this.trashOnDrive(item);
+                this.options.onStep?.({ kind: 'upload', done: ++done, total });
             }
             if (waiting.length === pending.length) {
                 for (const item of waiting) {
@@ -700,6 +722,7 @@ export class Mirror {
             }
             pending = waiting;
         }
+        this.options.onStep?.(null);
     }
 
     /**
