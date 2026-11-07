@@ -281,7 +281,8 @@ async function runAll(main: DatabaseSync, opts: { full?: boolean } & UploadOptio
         soon();
     };
     const onStep = (folder: string) => (step: SyncStep | null) => {
-        const startedMs = step?.kind === progress.step?.kind ? progress.step!.startedMs : Date.now();
+        // (Both being null means "no step": a run with nothing to catch up on.)
+        const startedMs = step && progress.step?.kind === step.kind ? progress.step.startedMs : Date.now();
         Object.assign(progress, { step: step && { ...step, folder, startedMs }, scanning: '' });
         soon();
     };
